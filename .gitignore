@@ -1,0 +1,6 @@
+# 忽略当前目录下的所有文件和文件夹
+*
+
+# 仅保留 KobukiNavigationStateChart_demo.c 和 .gitignore
+!KobukiNavigationStateChart_demo.c
+!.gitignore
