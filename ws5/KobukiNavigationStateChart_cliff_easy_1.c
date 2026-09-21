@@ -16,7 +16,10 @@ typedef enum{
 	CLIMB_RAMP,
 	DRIVE_ACROSS_TOP,
 	DESCEND_RAMP,
-	DRIVE_ON_LEVEL
+	DRIVE_ON_LEVEL,
+	CLIFF_BACKUP,
+	CLIFF_TURN_RIGHT,
+	CLIFF_TURN_LEFT
 } robotState_t;
 
 #define SLOPE_THRESHOLD_G		0.10
@@ -27,6 +30,9 @@ typedef enum{
 #define TOP_SPEED_MM_S			100
 #define DESCEND_SPEED_MM_S		80
 #define CLIFF_TURN_SPEED_MM_S	80
+#define CLIFF_BACKUP_SPEED_MM_S	80
+#define CLIFF_BACKUP_DISTANCE_MM	100
+#define CLIFF_TURN_ANGLE_DEG		45
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
@@ -56,7 +62,11 @@ void KobukiNavigationStatechart(
 
 	static robotState_t state = INITIAL;
 	static robotState_t unpausedState = APPROACH_RAMP;
+	static robotState_t stateBeforeCliff = APPROACH_RAMP;
 	static int16_t stableSampleCounter = 0;
+	static int32_t cliffStartDistance = 0;
+	static int32_t cliffStartAngle = 0;
+	static bool cliffTurnRight = true;
 
 	int16_t leftWheelSpeed = 0;
 	int16_t rightWheelSpeed = 0;
@@ -104,9 +114,27 @@ void KobukiNavigationStatechart(
 			break;
 		}
 	}
-	else if (cliffDetected){
-		/* Keep the current hill state while steering away from the cliff. */
+	else if (cliffDetected
+		&& (state == APPROACH_RAMP
+			|| state == CLIMB_RAMP
+			|| state == DRIVE_ACROSS_TOP
+			|| state == DESCEND_RAMP
+			|| state == DRIVE_ON_LEVEL)){
+		/* Save the route state, then back away before turning. */
+		stateBeforeCliff = state;
+		cliffTurnRight = sensors.cliffLeft || sensors.cliffCenter;
+		cliffStartDistance = netDistance;
 		stableSampleCounter = 0;
+		state = CLIFF_BACKUP;
+	}
+	else if (state == CLIFF_BACKUP
+		&& abs(netDistance - cliffStartDistance) >= CLIFF_BACKUP_DISTANCE_MM){
+		cliffStartAngle = netAngle;
+		state = cliffTurnRight ? CLIFF_TURN_RIGHT : CLIFF_TURN_LEFT;
+	}
+	else if ((state == CLIFF_TURN_RIGHT || state == CLIFF_TURN_LEFT)
+		&& abs(netAngle - cliffStartAngle) >= CLIFF_TURN_ANGLE_DEG){
+		state = stateBeforeCliff;
 	}
 	else{
 		bool transitionCondition = false;
@@ -170,26 +198,29 @@ void KobukiNavigationStatechart(
 	case DRIVE_ON_LEVEL:
 		leftWheelSpeed = rightWheelSpeed = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
 		break;
+	case CLIFF_BACKUP:
+		leftWheelSpeed = rightWheelSpeed = -limitSpeed(CLIFF_BACKUP_SPEED_MM_S, maxWheelSpeed);
+		break;
+	case CLIFF_TURN_RIGHT:
+		leftWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
+		rightWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
+		break;
+	case CLIFF_TURN_LEFT:
+		leftWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
+		rightWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
+		break;
 	default:
 		leftWheelSpeed = rightWheelSpeed = 0;
 		break;
 	}
 
-	/* Cliff avoidance has priority over slope-direction correction. */
+	/* Correct the travel direction using Y only during normal driving. */
 	if (state == APPROACH_RAMP
 		|| state == CLIMB_RAMP
 		|| state == DRIVE_ACROSS_TOP
 		|| state == DESCEND_RAMP
 		|| state == DRIVE_ON_LEVEL){
-		if (sensors.cliffLeft || sensors.cliffCenter){
-			leftWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
-		}
-		else if (sensors.cliffRight){
-			leftWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
-		}
-		else if (onSlope && accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
+		if (onSlope && accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Positive Y: curve right until Y returns close to zero. */
 			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
@@ -204,7 +235,5 @@ void KobukiNavigationStatechart(
 	*pLeftWheelSpeed = leftWheelSpeed;
 	*pRightWheelSpeed = rightWheelSpeed;
 
-	(void)netDistance;
-	(void)netAngle;
 	(void)isSimulator;
 }
