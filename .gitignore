@@ -4,5 +4,6 @@
 # 仅保留与追踪 demo 与 clever 源码文件
 !KobukiNavigationStateChart_demo.c
 !KobukiNavigationStateChart_clever.c
+!ws5/
+!ws5/KobukiNavigationStateChart_cliff_easy_1.c
 !.gitignore
-
