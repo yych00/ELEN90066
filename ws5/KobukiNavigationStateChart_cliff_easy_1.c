@@ -16,7 +16,7 @@ typedef enum{
 	CLIMB_RAMP,
 	DRIVE_ACROSS_TOP,
 	DESCEND_RAMP,
-	FINISHED
+	DRIVE_ON_LEVEL
 } robotState_t;
 
 #define SLOPE_THRESHOLD_G		0.10
@@ -127,7 +127,7 @@ void KobukiNavigationStatechart(
 			break;
 		case DESCEND_RAMP:
 			transitionCondition = !onSlope;
-			nextState = FINISHED;
+			nextState = DRIVE_ON_LEVEL;
 			break;
 		default:
 			transitionCondition = false;
@@ -167,8 +167,8 @@ void KobukiNavigationStatechart(
 	case DESCEND_RAMP:
 		leftWheelSpeed = rightWheelSpeed = limitSpeed(DESCEND_SPEED_MM_S, maxWheelSpeed);
 		break;
-	case FINISHED:
-		leftWheelSpeed = rightWheelSpeed = 0;
+	case DRIVE_ON_LEVEL:
+		leftWheelSpeed = rightWheelSpeed = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
 		break;
 	default:
 		leftWheelSpeed = rightWheelSpeed = 0;
@@ -179,7 +179,8 @@ void KobukiNavigationStatechart(
 	if (state == APPROACH_RAMP
 		|| state == CLIMB_RAMP
 		|| state == DRIVE_ACROSS_TOP
-		|| state == DESCEND_RAMP){
+		|| state == DESCEND_RAMP
+		|| state == DRIVE_ON_LEVEL){
 		if (sensors.cliffLeft || sensors.cliffCenter){
 			leftWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
