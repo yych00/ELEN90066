@@ -28,6 +28,11 @@ typedef enum{
 #define DESCEND_SPEED_MM_S		80
 #define CLIFF_TURN_SPEED_MM_S	80
 
+/* Keep the lateral acceleration near zero while travelling on a slope. */
+#define Y_ALIGNMENT_THRESHOLD_G	0.05
+#define Y_ALIGN_OUTER_SPEED_MM_S	120
+#define Y_ALIGN_INNER_SPEED_MM_S	80
+
 static int16_t limitSpeed(const int16_t requestedSpeed, const int16_t maxWheelSpeed)
 {
 	int16_t positiveLimit = maxWheelSpeed;
@@ -170,6 +175,7 @@ void KobukiNavigationStatechart(
 		break;
 	}
 
+	/* Cliff avoidance has priority over slope-direction correction. */
 	if (state == APPROACH_RAMP
 		|| state == CLIMB_RAMP
 		|| state == DRIVE_ACROSS_TOP
@@ -181,6 +187,16 @@ void KobukiNavigationStatechart(
 		else if (sensors.cliffRight){
 			leftWheelSpeed = -limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
+		}
+		else if (onSlope && accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
+			/* Positive Y: curve right until Y returns close to zero. */
+			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+		}
+		else if (onSlope && accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
+			/* Negative Y: curve left until Y returns close to zero. */
+			leftWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
 
