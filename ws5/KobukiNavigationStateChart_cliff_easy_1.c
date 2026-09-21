@@ -30,7 +30,8 @@ typedef enum{
 #define TOP_SPEED_MM_S			100
 #define DESCEND_SPEED_MM_S		80
 #define CLIFF_TURN_SPEED_MM_S	80
-#define CLIFF_BACKUP_SPEED_MM_S	80
+#define CLIFF_BACKUP_FAST_MM_S	100
+#define CLIFF_BACKUP_SLOW_MM_S	50
 #define CLIFF_BACKUP_DISTANCE_MM	100
 #define CLIFF_TURN_ANGLE_DEG		45
 
@@ -220,7 +221,16 @@ void KobukiNavigationStatechart(
 		leftWheelSpeed = rightWheelSpeed = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
 		break;
 	case CLIFF_BACKUP:
-		leftWheelSpeed = rightWheelSpeed = -limitSpeed(CLIFF_BACKUP_SPEED_MM_S, maxWheelSpeed);
+		if (cliffTurnRight){
+			/* Reverse in a right-hand arc, away from a left/centre cliff. */
+			leftWheelSpeed = -limitSpeed(CLIFF_BACKUP_SLOW_MM_S, maxWheelSpeed);
+			rightWheelSpeed = -limitSpeed(CLIFF_BACKUP_FAST_MM_S, maxWheelSpeed);
+		}
+		else{
+			/* Reverse in a left-hand arc, away from a right cliff. */
+			leftWheelSpeed = -limitSpeed(CLIFF_BACKUP_FAST_MM_S, maxWheelSpeed);
+			rightWheelSpeed = -limitSpeed(CLIFF_BACKUP_SLOW_MM_S, maxWheelSpeed);
+		}
 		break;
 	case CLIFF_TURN_RIGHT:
 		leftWheelSpeed = limitSpeed(CLIFF_TURN_SPEED_MM_S, maxWheelSpeed);
