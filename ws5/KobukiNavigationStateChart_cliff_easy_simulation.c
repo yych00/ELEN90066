@@ -245,21 +245,29 @@ void KobukiNavigationStatechart(
 		break;
 	}
 
-	/* Correct the travel direction using Y only during normal driving. */
-	if (state == APPROACH_RAMP
-		|| state == CLIMB_RAMP
-		|| state == DRIVE_ACROSS_TOP
-		|| state == DESCEND_RAMP
-		|| state == DRIVE_ON_LEVEL){
-		if (onSlope && accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
-			/* Positive Y: curve right until Y returns close to zero. */
+	/*
+	 * Y = 0 has two possible headings: straight uphill or straight downhill.
+	 * Reverse the correction direction while descending and do not apply it
+	 * on level-road states, where acceleration spikes can cause a U-turn.
+	 */
+	if (state == CLIMB_RAMP && onSlope){
+		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
-		else if (onSlope && accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
-			/* Negative Y: curve left until Y returns close to zero. */
+		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
 			leftWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+		}
+	}
+	else if (state == DESCEND_RAMP && downhillSlope){
+		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
+			leftWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+		}
+		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
+			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
 
