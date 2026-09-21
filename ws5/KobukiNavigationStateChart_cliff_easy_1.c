@@ -64,6 +64,7 @@ void KobukiNavigationStatechart(
 	static robotState_t unpausedState = APPROACH_RAMP;
 	static robotState_t stateBeforeCliff = APPROACH_RAMP;
 	static int16_t stableSampleCounter = 0;
+	static int16_t downhillSampleCounter = 0;
 	static int32_t cliffStartDistance = 0;
 	static int32_t cliffStartAngle = 0;
 	static bool cliffTurnRight = true;
@@ -72,6 +73,7 @@ void KobukiNavigationStatechart(
 	int16_t rightWheelSpeed = 0;
 
 	const bool onSlope = (fabs(accelAxes.x) >= SLOPE_THRESHOLD_G);
+	const bool downhillSlope = (accelAxes.x <= -SLOPE_THRESHOLD_G);
 	const bool cliffDetected = sensors.cliffLeft
 		|| sensors.cliffCenter
 		|| sensors.cliffRight;
@@ -81,12 +83,14 @@ void KobukiNavigationStatechart(
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
 		unpausedState = APPROACH_RAMP;
 		stableSampleCounter = 0;
+		downhillSampleCounter = 0;
 	}
 	else if (state == INITIAL
 		|| state == PAUSE_WAIT_BUTTON_RELEASE
 		|| state == UNPAUSE_WAIT_BUTTON_PRESS
 		|| state == UNPAUSE_WAIT_BUTTON_RELEASE
 		|| sensors.buttons.B0){
+		downhillSampleCounter = 0;
 		switch (state){
 		case INITIAL:
 			unpausedState = APPROACH_RAMP;
@@ -125,6 +129,7 @@ void KobukiNavigationStatechart(
 		cliffTurnRight = sensors.cliffLeft || sensors.cliffCenter;
 		cliffStartDistance = netDistance;
 		stableSampleCounter = 0;
+		downhillSampleCounter = 0;
 		state = CLIFF_BACKUP;
 	}
 	else if (state == CLIFF_BACKUP
@@ -136,9 +141,25 @@ void KobukiNavigationStatechart(
 		&& abs(netAngle - cliffStartAngle) >= CLIFF_TURN_ANGLE_DEG){
 		state = stateBeforeCliff;
 	}
+	else if (downhillSlope
+		&& state != DESCEND_RAMP
+		&& state != CLIFF_BACKUP
+		&& state != CLIFF_TURN_RIGHT
+		&& state != CLIFF_TURN_LEFT){
+		/* A stable negative X value means the robot is facing downhill. */
+		stableSampleCounter = 0;
+		if (downhillSampleCounter < STABLE_SAMPLE_COUNT){
+			downhillSampleCounter++;
+		}
+		if (downhillSampleCounter >= STABLE_SAMPLE_COUNT){
+			state = DESCEND_RAMP;
+			downhillSampleCounter = 0;
+		}
+	}
 	else{
 		bool transitionCondition = false;
 		robotState_t nextState = state;
+		downhillSampleCounter = 0;
 
 		switch (state){
 		case APPROACH_RAMP:
@@ -150,7 +171,7 @@ void KobukiNavigationStatechart(
 			nextState = DRIVE_ACROSS_TOP;
 			break;
 		case DRIVE_ACROSS_TOP:
-			transitionCondition = onSlope;
+			transitionCondition = downhillSlope;
 			nextState = DESCEND_RAMP;
 			break;
 		case DESCEND_RAMP:
