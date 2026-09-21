@@ -22,11 +22,11 @@ typedef enum{
 	CLIFF_TURN_LEFT
 } robotState_t;
 
-#define SLOPE_THRESHOLD_G		0.10
+#define SLOPE_THRESHOLD_G		0.02
 #define STABLE_SAMPLE_COUNT		5
 
-#define APPROACH_SPEED_MM_S		100
-#define CLIMB_SPEED_MM_S		150
+#define APPROACH_SPEED_MM_S		160
+#define CLIMB_SPEED_MM_S		200
 #define TOP_SPEED_MM_S			100
 #define DESCEND_SPEED_MM_S		80
 #define CLIFF_TURN_SPEED_MM_S	80
@@ -36,8 +36,8 @@ typedef enum{
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
-#define Y_ALIGN_OUTER_SPEED_MM_S	120
-#define Y_ALIGN_INNER_SPEED_MM_S	80
+#define Y_ALIGN_OUTER_SPEED_MM_S	180
+#define Y_ALIGN_INNER_SPEED_MM_S	140
 
 static int16_t limitSpeed(const int16_t requestedSpeed, const int16_t maxWheelSpeed)
 {
