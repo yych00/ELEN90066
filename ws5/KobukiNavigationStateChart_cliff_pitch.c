@@ -29,7 +29,7 @@ typedef enum{
  * Positive pitch means uphill. Use +/-5 degrees to classify slopes;
  * smaller tilt magnitudes are treated as level ground.
  */
-#define PITCH_THRESHOLD_DEG		5.0
+#define PITCH_THRESHOLD_DEG		4.0
 #define RAD_TO_DEG				57.29577951308232
 /* Five-sample rolling mean provides smoothing; no extra confirmation delay. */
 #define PITCH_FILTER_SAMPLE_COUNT 5
