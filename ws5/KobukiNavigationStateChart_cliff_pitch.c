@@ -46,7 +46,7 @@ typedef enum{
 #define CLIFF_TURN_ANGLE_DEG		30
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
-#define Y_ALIGNMENT_THRESHOLD_G	0.02
+#define Y_ALIGNMENT_THRESHOLD_G	0.008
 #define Y_FILTER_SAMPLE_COUNT    5
 #define UPHILL_ALIGN_OUTER_SPEED_MM_S	140
 #define UPHILL_ALIGN_INNER_SPEED_MM_S	120
