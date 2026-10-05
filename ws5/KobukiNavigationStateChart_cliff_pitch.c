@@ -41,7 +41,7 @@ typedef enum{
 #define CLIFF_BACKUP_FAST_MM_S	80
 #define CLIFF_BACKUP_SLOW_MM_S	50
 #define CLIFF_BACKUP_DISTANCE_MM	80
-#define CLIFF_TURN_ANGLE_DEG		45
+#define CLIFF_TURN_ANGLE_DEG		30
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
