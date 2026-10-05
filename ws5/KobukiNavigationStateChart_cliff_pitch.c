@@ -321,10 +321,13 @@ void KobukiNavigationStatechart(
 	/*
 	 * Y = 0 has two possible headings: straight uphill or straight downhill.
 	 * The correction direction must therefore be reversed while descending.
+	 * Check Y on every call throughout the climb/descent state, without
+	 * pitch gating or sample confirmation. Returning to the Y deadband
+	 * immediately restores the state's normal straight-driving speed.
 	 * Do not apply slope alignment on level-road states, where acceleration
 	 * spikes could otherwise make the robot turn back toward the ramp.
 	 */
-	if (state == CLIMB_RAMP && uphillSlope){
+	if (state == CLIMB_RAMP){
 		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Uphill, positive Y: curve right. */
 			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
@@ -336,7 +339,7 @@ void KobukiNavigationStatechart(
 			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
-	else if (state == DESCEND_RAMP && downhillSlope){
+	else if (state == DESCEND_RAMP){
 		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Downhill, positive Y: curve left (opposite to uphill). */
 			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
