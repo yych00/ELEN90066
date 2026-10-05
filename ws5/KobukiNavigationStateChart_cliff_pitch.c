@@ -31,7 +31,9 @@ typedef enum{
  */
 #define PITCH_THRESHOLD_DEG		5.0
 #define RAD_TO_DEG				57.29577951308232
-#define STABLE_SAMPLE_COUNT		5
+/* Exponential smoothing: smaller alpha is smoother but responds slower. */
+#define PITCH_FILTER_ALPHA       0.20
+#define STABLE_SAMPLE_COUNT		15
 
 #define APPROACH_SPEED_MM_S		160
 #define CLIMB_SPEED_MM_S		200
@@ -104,6 +106,8 @@ void KobukiNavigationStatechart(
 	static int32_t				cliffStartDistance = 0;
 	static int32_t				cliffStartAngle = 0;
 	static bool					cliffTurnRight = true;
+	static double                   filteredPitchDeg = 0.0;
+	static bool                     pitchFilterInitialized = false;
 
 	// outputs
 	int16_t						leftWheelSpeed = 0;				// speed of the left wheel, in mm/s
@@ -118,8 +122,19 @@ void KobukiNavigationStatechart(
 	const double transverseGravity = sqrt(
 		(double)accelAxes.y * accelAxes.y
 		+ (double)accelAxes.z * accelAxes.z);
-	const double pitchDeg = atan2((double)accelAxes.x, transverseGravity)
+	const double rawPitchDeg = atan2((double)accelAxes.x, transverseGravity)
 		* RAD_TO_DEG;
+	/* Seed from the first sample; do not introduce a fictitious zero tilt.
+	 * Update on every call, including pause and cliff avoidance.
+	 */
+	if (!pitchFilterInitialized){
+		filteredPitchDeg = rawPitchDeg;
+		pitchFilterInitialized = true;
+	}
+	else{
+		filteredPitchDeg += PITCH_FILTER_ALPHA * (rawPitchDeg - filteredPitchDeg);
+	}
+	const double pitchDeg = filteredPitchDeg;
 	const bool uphillSlope = (pitchDeg >= PITCH_THRESHOLD_DEG);
 	const bool downhillSlope = (pitchDeg <= -PITCH_THRESHOLD_DEG);
 	const bool onSlope = uphillSlope || downhillSlope;
@@ -130,6 +145,7 @@ void KobukiNavigationStatechart(
 
 	/* B1 is a reset button: stop and require a fresh B0 press to start. */
 	if (sensors.buttons.B1){
+		pitchFilterInitialized = false;
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
 		unpausedState = APPROACH_RAMP;
 		stableSampleCounter = 0;
@@ -141,9 +157,11 @@ void KobukiNavigationStatechart(
 		|| state == UNPAUSE_WAIT_BUTTON_RELEASE
 		|| sensors.buttons.B0				// pause button
 		){
+		stableSampleCounter = 0;
 		downhillSampleCounter = 0;
 		switch (state){
 		case INITIAL:
+			pitchFilterInitialized = false;
 			/* Start every run from the beginning of the straight course. */
 			unpausedState = APPROACH_RAMP;
 			stableSampleCounter = 0;
