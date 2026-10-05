@@ -45,8 +45,32 @@ typedef enum{
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
-#define Y_ALIGN_OUTER_SPEED_MM_S	180
-#define Y_ALIGN_INNER_SPEED_MM_S	140
+#define Y_ALIGN_OUTER_SPEED_MM_S	140
+#define Y_ALIGN_INNER_SPEED_MM_S	120
+
+/* Fixed wheel calibration, independent of slope alignment.
+ * -0.01: boost the left wheel by 1% to correct a leftward drift.
+ * +0.01: boost the right wheel by 1% to correct a rightward drift.
+ *  0.00: no boost. Edit this value and rebuild to tune the robot.
+ */
+#ifndef WHEEL_SPEED_TRIM
+#define WHEEL_SPEED_TRIM         0.00
+#endif
+
+static int16_t trimWheelSpeed(const int16_t speed, const double boost,
+                             const int16_t maxWheelSpeed)
+{
+	/* Preserve direction, round to mm/s, then clamp before the int16 cast. */
+	double magnitude = floor(fabs((double)speed) * (1.0 + boost) + 0.5);
+	const double speedLimit = fabs((double)maxWheelSpeed);
+	if (magnitude > speedLimit){
+		magnitude = speedLimit;
+	}
+	if (magnitude > 32767.0){
+		magnitude = 32767.0;
+	}
+	return (int16_t)((speed < 0) ? -magnitude : magnitude);
+}
 
 static int16_t limitSpeed(const int16_t requestedSpeed, const int16_t maxWheelSpeed)
 {
@@ -324,8 +348,13 @@ void KobukiNavigationStatechart(
 	}
 
 
-	*pLeftWheelSpeed = leftWheelSpeed;
-	*pRightWheelSpeed = rightWheelSpeed;
+	/* Apply calibration to final commands, including reverse and turns.
+	 * A stopped wheel stays stopped; saturation can reduce the boost.
+	 */
+	*pLeftWheelSpeed = trimWheelSpeed(leftWheelSpeed,
+		(WHEEL_SPEED_TRIM < 0.0) ? -WHEEL_SPEED_TRIM : 0.0, maxWheelSpeed);
+	*pRightWheelSpeed = trimWheelSpeed(rightWheelSpeed,
+		(WHEEL_SPEED_TRIM > 0.0) ? WHEEL_SPEED_TRIM : 0.0, maxWheelSpeed);
 
 	(void)isSimulator;
 }
