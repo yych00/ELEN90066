@@ -45,8 +45,10 @@ typedef enum{
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
-#define Y_ALIGN_OUTER_SPEED_MM_S	140
-#define Y_ALIGN_INNER_SPEED_MM_S	120
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S	140
+#define UPHILL_ALIGN_INNER_SPEED_MM_S	120
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 70
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S 50
 
 /* Fixed wheel calibration, independent of slope alignment.
  * -0.01: boost the left wheel by 1% to correct a leftward drift.
@@ -325,25 +327,25 @@ void KobukiNavigationStatechart(
 	if (state == CLIMB_RAMP && uphillSlope){
 		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Uphill, positive Y: curve right. */
-			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
 		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
 			/* Uphill, negative Y: curve left. */
-			leftWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
 	else if (state == DESCEND_RAMP && downhillSlope){
 		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Downhill, positive Y: curve left (opposite to uphill). */
-			leftWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
 			/* Downhill, negative Y: curve right (opposite to uphill). */
-			leftWheelSpeed = limitSpeed(Y_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-			rightWheelSpeed = limitSpeed(Y_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
 
