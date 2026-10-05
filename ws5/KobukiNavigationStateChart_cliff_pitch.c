@@ -26,10 +26,10 @@ typedef enum{
 } robotState_t;
 
 /* accelAxes is measured in g; pitch is measured in degrees.
- * asin(0.02) is approximately 1.146 degrees, matching the old threshold
- * for a stationary robot under 1 g. Positive pitch means uphill.
+ * Positive pitch means uphill. Use +/-5 degrees to classify slopes;
+ * smaller tilt magnitudes are treated as level ground.
  */
-#define PITCH_THRESHOLD_DEG		1.145991998
+#define PITCH_THRESHOLD_DEG		5.0
 #define RAD_TO_DEG				57.29577951308232
 #define STABLE_SAMPLE_COUNT		5
 
