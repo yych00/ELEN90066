@@ -25,34 +25,40 @@ typedef enum{
 
 } robotState_t;
 
-/* accelAxes is measured in g; pitch is measured in degrees.
- * Positive pitch means uphill. Use +/-5 degrees to classify slopes;
- * smaller tilt magnitudes are treated as level ground.
+/* 【坡度控制：前后倾角判断】加速度单位为 g，pitch 单位为度。
+ * pitch >= +5° 为上坡，pitch <= -5° 为下坡，中间按平地处理。
+ * 连续 5 次原始 pitch 都满足条件才切换状态；不对 pitch 取平均。
  */
-#define PITCH_THRESHOLD_DEG		5.0
-#define RAD_TO_DEG				57.29577951308232
-/* Each of five consecutive raw pitch readings must satisfy the condition. */
-#define STABLE_SAMPLE_COUNT		5
+#define PITCH_THRESHOLD_DEG		5.0                 // 上下坡角度阈值
+#define RAD_TO_DEG				57.29577951308232    // 弧度转角度：180 / pi
+#define STABLE_SAMPLE_COUNT		5                   // 坡度状态连续确认次数
 
-#define APPROACH_SPEED_MM_S		160
-#define CLIMB_SPEED_MM_S		200
-#define TOP_SPEED_MM_S			100
-#define DESCEND_SPEED_MM_S		80
-#define CLIFF_TURN_SPEED_MM_S	80
-#define CLIFF_BACKUP_FAST_MM_S	80
-#define CLIFF_BACKUP_SLOW_MM_S	50
-#define CLIFF_BACKUP_DISTANCE_MM	80
-#define CLIFF_TURN_ANGLE_DEG		30
+/* 【坡度控制：各行驶阶段的基础轮速】单位：mm/s。 */
+#define APPROACH_SPEED_MM_S		160 // 接近坡道、下坡后平地直行
+#define CLIMB_SPEED_MM_S		200 // 上坡正常直行
+#define TOP_SPEED_MM_S			100 // 坡顶平地直行
+#define DESCEND_SPEED_MM_S		80  // 下坡正常直行
 
-/* Keep the lateral acceleration near zero while travelling on a slope. */
-#define Y_ALIGNMENT_THRESHOLD_G	0.02
-#define Y_FILTER_SAMPLE_COUNT    5
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S	140
-#define UPHILL_ALIGN_INNER_SPEED_MM_S	120
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 70
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S 50
+/* 【Cliff 悬崖避让：先弧线倒车，再原地转向】不使用 pitch 或 Y 判断。 */
+#define CLIFF_TURN_SPEED_MM_S	80  // 原地转向轮速大小，左右轮方向相反
+#define CLIFF_BACKUP_FAST_MM_S	80  // 倒车较快轮速度大小，输出时加负号
+#define CLIFF_BACKUP_SLOW_MM_S	50  // 倒车较慢轮速度大小，输出时加负号
+#define CLIFF_BACKUP_DISTANCE_MM	80  // 倒车距离阈值：80 mm
+#define CLIFF_TURN_ANGLE_DEG		30  // 避让转向角度：30°
 
-/* Fixed wheel calibration, independent of slope alignment.
+/* 【坡度控制：Y 方向差速纠偏】只在上坡、下坡状态中生效。
+ * 最近 5 次 Y 取平均，与 +/-0.02g 比较；不额外连续确认。
+ * 外侧轮比内侧轮快，左右轮的分配由纠偏方向决定。
+ */
+#define Y_ALIGNMENT_THRESHOLD_G	0.02 // Y 平均值的纠偏阈值，单位 g
+#define Y_FILTER_SAMPLE_COUNT    5    // Y 滑动平均窗口，区别于 pitch 连续检测
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S	140 // 上坡纠偏外侧轮
+#define UPHILL_ALIGN_INNER_SPEED_MM_S	120 // 上坡纠偏内侧轮
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 70 // 下坡纠偏外侧轮
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S 50 // 下坡纠偏内侧轮
+
+/* 【通用轮速补偿：坡度行驶与 Cliff 避让都应用】
+ * Fixed wheel calibration, independent of slope alignment.
  * -0.01: boost the left wheel by 1% to correct a leftward drift.
  * +0.01: boost the right wheel by 1% to correct a rightward drift.
  *  0.00: no boost. Edit this value and rebuild to tune the robot.
@@ -118,7 +124,8 @@ void KobukiNavigationStatechart(
 	//*****************************************************
 	// state data - process inputs                        *
 	//*****************************************************
-	/* X points along the robot; Y and Z form the transverse plane.
+	/* 【坡度控制】使用加速度计计算原始 pitch，供上下坡状态判断。
+	 * X points along the robot; Y and Z form the transverse plane.
 	 * This accelerometer-only estimate assumes gravity dominates motion.
 	 */
 	const double transverseGravity = sqrt(
@@ -129,7 +136,8 @@ void KobukiNavigationStatechart(
 	const bool uphillSlope = (pitchDeg >= PITCH_THRESHOLD_DEG);
 	const bool downhillSlope = (pitchDeg <= -PITCH_THRESHOLD_DEG);
 	const bool onSlope = uphillSlope || downhillSlope;
-	/* Rolling mean of the latest five raw Y readings, updated every call.
+	/* 【坡度控制】计算 Y 的 5 次滑动平均，供方向纠偏使用。
+	 * Rolling mean of the latest five raw Y readings, updated every call.
 	 * Wait for a complete window after startup/reset before correcting.
 	 */
 	if (ySampleCount == Y_FILTER_SAMPLE_COUNT){
@@ -143,12 +151,14 @@ void KobukiNavigationStatechart(
 	ySampleIndex = (ySampleIndex + 1) % Y_FILTER_SAMPLE_COUNT;
 	const bool yFilterReady = (ySampleCount == Y_FILTER_SAMPLE_COUNT);
 	const double filteredY = ySampleSum / ySampleCount;
+	/* 【Cliff 检测】左、中、右任一悬崖传感器触发即视为悬崖。 */
 	const bool cliffDetected = sensors.cliffLeft
 		|| sensors.cliffCenter
 		|| sensors.cliffRight;
 
 
-	/* B1 is a reset button: stop and require a fresh B0 press to start. */
+	/* 【通用按钮控制】B1 重置；B0 启动、暂停、恢复，优先于避让与坡度控制。
+	 * B1 is a reset button: stop and require a fresh B0 press to start. */
 	if (sensors.buttons.B1){
 		ySampleSum = 0.0;
 		ySampleIndex = 0;
@@ -204,6 +214,9 @@ void KobukiNavigationStatechart(
 	//*************************************
 	// state transition - run region      *
 	//*************************************
+	/* 【Cliff 状态切换】检测悬崖 -> 倒车 80 mm -> 转向 30° -> 恢复原阶段。
+	 * 优先于坡度状态切换；倒车、转向期间不重复触发同一避让动作。
+	 */
 	else if (cliffDetected
 		&& (state == APPROACH_RAMP
 			|| state == CLIMB_RAMP
@@ -227,6 +240,7 @@ void KobukiNavigationStatechart(
 		&& abs(netAngle - cliffStartAngle) >= CLIFF_TURN_ANGLE_DEG){
 		state = stateBeforeCliff;
 	}
+	/* 【坡度控制】连续 5 次检测到下坡，可从正常行驶阶段直接进入下坡。 */
 	else if (downhillSlope
 		&& state != DESCEND_RAMP
 		&& state != CLIFF_BACKUP
@@ -242,6 +256,7 @@ void KobukiNavigationStatechart(
 			downhillSampleCounter = 0;
 		}
 	}
+	/* 【坡度控制】接近坡道 -> 上坡 -> 坡顶 -> 下坡 -> 平地，连续 5 次确认。 */
 	else{
 		bool transitionCondition = false;
 		robotState_t nextState = state;
@@ -296,6 +311,7 @@ void KobukiNavigationStatechart(
 		leftWheelSpeed = rightWheelSpeed = 0;
 		break;
 
+	/* 【坡度控制动作】按当前行驶阶段设置两轮基础速度。 */
 	case APPROACH_RAMP:
 		leftWheelSpeed = rightWheelSpeed = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
 		break;
@@ -316,6 +332,7 @@ void KobukiNavigationStatechart(
 		leftWheelSpeed = rightWheelSpeed = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
 		break;
 
+	/* 【Cliff 动作】弧线倒车与原地转向的轮速设置。 */
 	case CLIFF_BACKUP:
 		if (cliffTurnRight){
 			/* Reverse in a right-hand arc, away from a left/centre cliff. */
@@ -345,7 +362,7 @@ void KobukiNavigationStatechart(
 		break;
 	}
 
-	/*
+	/* 【坡度控制动作：Y 差速纠偏】在基础轮速之后执行，覆盖两轮速度。
 	 * Y = 0 has two possible headings: straight uphill or straight downhill.
 	 * The correction direction must therefore be reversed while descending.
 	 * Check the five-sample Y mean on every call during climb/descent,
@@ -380,7 +397,8 @@ void KobukiNavigationStatechart(
 	}
 
 
-	/* Apply calibration to final commands, including reverse and turns.
+	/* 【通用输出】最后应用固定轮速补偿和限速，作用于所有动作。
+	 * Apply calibration to final commands, including reverse and turns.
 	 * A stopped wheel stays stopped; saturation can reduce the boost.
 	 */
 	*pLeftWheelSpeed = trimWheelSpeed(leftWheelSpeed,
