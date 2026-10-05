@@ -153,7 +153,8 @@ void KobukiNavigationStatechart(
 	int uphillVotes = 0;
 	int downhillVotes = 0;
 	int levelVotes = 0;
-	for (int sampleIndex = 0; sampleIndex < pitchSampleCount; sampleIndex++){
+	int sampleIndex;
+	for (sampleIndex = 0; sampleIndex < pitchSampleCount; sampleIndex++){
 		if (pitchSamples[sampleIndex] == 1){ uphillVotes++; }
 		else if (pitchSamples[sampleIndex] == -1){ downhillVotes++; }
 		else{ levelVotes++; }
