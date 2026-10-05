@@ -31,7 +31,7 @@ typedef enum{
  * 启动、暂停、避让及状态切换后重新收满 8 次；不对 pitch 取平均。
  */
 #define PITCH_THRESHOLD_DEG		5.0                 // 上下坡角度阈值
-#define RAD_TO_DEG				20    				// 弧度转角度：180 / pi
+#define RAD_TO_DEG				57.29577951308232   // 弧度转角度：180 / pi
 #define PITCH_WINDOW_SAMPLE_COUNT 8                 // pitch 检测滑动窗口
 #define PITCH_REQUIRED_SAMPLE_COUNT 7               // 窗口内至少 7 次同类结果
 
