@@ -31,9 +31,9 @@ typedef enum{
  */
 #define PITCH_THRESHOLD_DEG		5.0
 #define RAD_TO_DEG				57.29577951308232
-/* Exponential smoothing: smaller alpha is smoother but responds slower. */
-#define PITCH_FILTER_ALPHA       0.20
-#define STABLE_SAMPLE_COUNT		15
+/* Five-sample rolling mean provides smoothing; no extra confirmation delay. */
+#define PITCH_FILTER_SAMPLE_COUNT 5
+#define STABLE_SAMPLE_COUNT		1
 
 #define APPROACH_SPEED_MM_S		160
 #define CLIMB_SPEED_MM_S		200
@@ -46,7 +46,7 @@ typedef enum{
 #define CLIFF_TURN_ANGLE_DEG		30
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
-#define Y_ALIGNMENT_THRESHOLD_G	0.008
+#define Y_ALIGNMENT_THRESHOLD_G	0.02
 #define Y_FILTER_SAMPLE_COUNT    5
 #define UPHILL_ALIGN_OUTER_SPEED_MM_S	140
 #define UPHILL_ALIGN_INNER_SPEED_MM_S	120
@@ -107,8 +107,10 @@ void KobukiNavigationStatechart(
 	static int32_t				cliffStartDistance = 0;
 	static int32_t				cliffStartAngle = 0;
 	static bool					cliffTurnRight = true;
-	static double                   filteredPitchDeg = 0.0;
-	static bool                     pitchFilterInitialized = false;
+	static double                   pitchSamples[PITCH_FILTER_SAMPLE_COUNT] = {0};
+	static double                   pitchSampleSum = 0.0;
+	static int                      pitchSampleIndex = 0;
+	static int                      pitchSampleCount = 0;
 	static double                   ySamples[Y_FILTER_SAMPLE_COUNT] = {0};
 	static double                   ySampleSum = 0.0;
 	static int                      ySampleIndex = 0;
@@ -129,19 +131,22 @@ void KobukiNavigationStatechart(
 		+ (double)accelAxes.z * accelAxes.z);
 	const double rawPitchDeg = atan2((double)accelAxes.x, transverseGravity)
 		* RAD_TO_DEG;
-	/* Seed from the first sample; do not introduce a fictitious zero tilt.
-	 * Update on every call, including pause and cliff avoidance.
+	/* Average the latest five pitch angles on every call. After reset,
+	 * collect a complete window before allowing slope classification.
 	 */
-	if (!pitchFilterInitialized){
-		filteredPitchDeg = rawPitchDeg;
-		pitchFilterInitialized = true;
+	if (pitchSampleCount == PITCH_FILTER_SAMPLE_COUNT){
+		pitchSampleSum -= pitchSamples[pitchSampleIndex];
 	}
 	else{
-		filteredPitchDeg += PITCH_FILTER_ALPHA * (rawPitchDeg - filteredPitchDeg);
+		pitchSampleCount++;
 	}
-	const double pitchDeg = filteredPitchDeg;
-	const bool uphillSlope = (pitchDeg >= PITCH_THRESHOLD_DEG);
-	const bool downhillSlope = (pitchDeg <= -PITCH_THRESHOLD_DEG);
+	pitchSamples[pitchSampleIndex] = rawPitchDeg;
+	pitchSampleSum += rawPitchDeg;
+	pitchSampleIndex = (pitchSampleIndex + 1) % PITCH_FILTER_SAMPLE_COUNT;
+	const bool pitchFilterReady = (pitchSampleCount == PITCH_FILTER_SAMPLE_COUNT);
+	const double pitchDeg = pitchSampleSum / pitchSampleCount;
+	const bool uphillSlope = pitchFilterReady && (pitchDeg >= PITCH_THRESHOLD_DEG);
+	const bool downhillSlope = pitchFilterReady && (pitchDeg <= -PITCH_THRESHOLD_DEG);
 	const bool onSlope = uphillSlope || downhillSlope;
 	/* Rolling mean of the latest five raw Y readings, updated every call.
 	 * Wait for a complete window after startup/reset before correcting.
@@ -167,7 +172,9 @@ void KobukiNavigationStatechart(
 		ySampleSum = 0.0;
 		ySampleIndex = 0;
 		ySampleCount = 0;
-		pitchFilterInitialized = false;
+		pitchSampleSum = 0.0;
+		pitchSampleIndex = 0;
+		pitchSampleCount = 0;
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
 		unpausedState = APPROACH_RAMP;
 		stableSampleCounter = 0;
@@ -186,7 +193,9 @@ void KobukiNavigationStatechart(
 			ySampleSum = 0.0;
 			ySampleIndex = 0;
 			ySampleCount = 0;
-			pitchFilterInitialized = false;
+			pitchSampleSum = 0.0;
+			pitchSampleIndex = 0;
+			pitchSampleCount = 0;
 			/* Start every run from the beginning of the straight course. */
 			unpausedState = APPROACH_RAMP;
 			stableSampleCounter = 0;
@@ -269,7 +278,7 @@ void KobukiNavigationStatechart(
 			nextState = CLIMB_RAMP;
 			break;
 		case CLIMB_RAMP:
-			transitionCondition = !onSlope;
+			transitionCondition = pitchFilterReady && !onSlope;
 			nextState = DRIVE_ACROSS_TOP;
 			break;
 		case DRIVE_ACROSS_TOP:
@@ -277,7 +286,7 @@ void KobukiNavigationStatechart(
 			nextState = DESCEND_RAMP;
 			break;
 		case DESCEND_RAMP:
-			transitionCondition = !onSlope;
+			transitionCondition = pitchFilterReady && !onSlope;
 			nextState = DRIVE_ON_LEVEL;
 			break;
 		default:
