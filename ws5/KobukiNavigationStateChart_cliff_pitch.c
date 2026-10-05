@@ -27,35 +27,37 @@ typedef enum{
 
 /* 【坡度控制：前后倾角判断】加速度单位为 g，pitch 单位为度。
  * pitch >= +5° 为上坡，pitch <= -5° 为下坡，中间按平地处理。
- * 连续 5 次原始 pitch 都满足条件才切换状态；不对 pitch 取平均。
+ * 最近 8 次原始 pitch 中至少 7 次满足条件才切换状态；允许 1 次不满足。
+ * 启动、暂停、避让及状态切换后重新收满 8 次；不对 pitch 取平均。
  */
 #define PITCH_THRESHOLD_DEG		5.0                 // 上下坡角度阈值
-#define RAD_TO_DEG				57.29577951308232    // 弧度转角度：180 / pi
-#define STABLE_SAMPLE_COUNT		5                   // 坡度状态连续确认次数
+#define RAD_TO_DEG				20    				// 弧度转角度：180 / pi
+#define PITCH_WINDOW_SAMPLE_COUNT 8                 // pitch 检测滑动窗口
+#define PITCH_REQUIRED_SAMPLE_COUNT 7               // 窗口内至少 7 次同类结果
 
 /* 【坡度控制：各行驶阶段的基础轮速】单位：mm/s。 */
-#define APPROACH_SPEED_MM_S		160 // 接近坡道、下坡后平地直行
+#define APPROACH_SPEED_MM_S		150 // 接近坡道、下坡后平地直行
 #define CLIMB_SPEED_MM_S		200 // 上坡正常直行
-#define TOP_SPEED_MM_S			100 // 坡顶平地直行
-#define DESCEND_SPEED_MM_S		80  // 下坡正常直行
+#define TOP_SPEED_MM_S			150 // 坡顶平地直行
+#define DESCEND_SPEED_MM_S		100  // 下坡正常直行
 
 /* 【Cliff 悬崖避让：先弧线倒车，再原地转向】不使用 pitch 或 Y 判断。 */
 #define CLIFF_TURN_SPEED_MM_S	80  // 原地转向轮速大小，左右轮方向相反
 #define CLIFF_BACKUP_FAST_MM_S	80  // 倒车较快轮速度大小，输出时加负号
 #define CLIFF_BACKUP_SLOW_MM_S	50  // 倒车较慢轮速度大小，输出时加负号
-#define CLIFF_BACKUP_DISTANCE_MM	80  // 倒车距离阈值：80 mm
+#define CLIFF_BACKUP_DISTANCE_MM	60  // 倒车距离阈值：60 mm
 #define CLIFF_TURN_ANGLE_DEG		30  // 避让转向角度：30°
 
 /* 【坡度控制：Y 方向差速纠偏】只在上坡、下坡状态中生效。
- * 最近 5 次 Y 取平均，与 +/-0.02g 比较；不额外连续确认。
+ * 最近 5 次 Y 取平均，与 Y_ALIGNMENT_THRESHOLD_G 的正负阈值比较；不额外连续确认。
  * 外侧轮比内侧轮快，左右轮的分配由纠偏方向决定。
  */
-#define Y_ALIGNMENT_THRESHOLD_G	0.02 // Y 平均值的纠偏阈值，单位 g
-#define Y_FILTER_SAMPLE_COUNT    5    // Y 滑动平均窗口，区别于 pitch 连续检测
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S	140 // 上坡纠偏外侧轮
-#define UPHILL_ALIGN_INNER_SPEED_MM_S	120 // 上坡纠偏内侧轮
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 70 // 下坡纠偏外侧轮
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S 50 // 下坡纠偏内侧轮
+#define Y_ALIGNMENT_THRESHOLD_G	0.01 // Y 平均值的纠偏阈值，单位 g
+#define Y_FILTER_SAMPLE_COUNT    5   // Y 滑动平均窗口，区别于 pitch 的 8 次中 7 次检测
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S	200 // 上坡纠偏外侧轮
+#define UPHILL_ALIGN_INNER_SPEED_MM_S	150 // 上坡纠偏内侧轮
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 100 // 下坡纠偏外侧轮
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S 75 // 下坡纠偏内侧轮
 
 /* 【通用轮速补偿：坡度行驶与 Cliff 避让都应用】
  * Fixed wheel calibration, independent of slope alignment.
@@ -107,8 +109,9 @@ void KobukiNavigationStatechart(
 	static robotState_t 		state = INITIAL;				// current program state
 	static robotState_t			unpausedState = APPROACH_RAMP;	// state history for pause region
 	static robotState_t			stateBeforeCliff = APPROACH_RAMP;
-	static int16_t				stableSampleCounter = 0;
-	static int16_t				downhillSampleCounter = 0;
+	static int                      pitchSamples[PITCH_WINDOW_SAMPLE_COUNT] = {0};
+	static int                      pitchSampleIndex = 0;
+	static int                      pitchSampleCount = 0;
 	static int32_t				cliffStartDistance = 0;
 	static int32_t				cliffStartAngle = 0;
 	static bool					cliffTurnRight = true;
@@ -133,9 +136,32 @@ void KobukiNavigationStatechart(
 		+ (double)accelAxes.z * accelAxes.z);
 	const double pitchDeg = atan2((double)accelAxes.x, transverseGravity)
 		* RAD_TO_DEG;
-	const bool uphillSlope = (pitchDeg >= PITCH_THRESHOLD_DEG);
-	const bool downhillSlope = (pitchDeg <= -PITCH_THRESHOLD_DEG);
-	const bool onSlope = uphillSlope || downhillSlope;
+	/* 【坡度控制】记录每次分类：+1 上坡，-1 下坡，0 平地。
+	 * 只采集正常行驶中的读数，避免暂停、倒车、转向污染窗口。
+	 */
+	if (!sensors.buttons.B0 && !sensors.buttons.B1
+		&& (state == APPROACH_RAMP || state == CLIMB_RAMP
+			|| state == DRIVE_ACROSS_TOP || state == DESCEND_RAMP
+			|| state == DRIVE_ON_LEVEL)){
+		pitchSamples[pitchSampleIndex] = (pitchDeg >= PITCH_THRESHOLD_DEG) ? 1
+			: ((pitchDeg <= -PITCH_THRESHOLD_DEG) ? -1 : 0);
+		pitchSampleIndex = (pitchSampleIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
+		if (pitchSampleCount < PITCH_WINDOW_SAMPLE_COUNT){
+			pitchSampleCount++;
+		}
+	}
+	int uphillVotes = 0;
+	int downhillVotes = 0;
+	int levelVotes = 0;
+	for (int sampleIndex = 0; sampleIndex < pitchSampleCount; sampleIndex++){
+		if (pitchSamples[sampleIndex] == 1){ uphillVotes++; }
+		else if (pitchSamples[sampleIndex] == -1){ downhillVotes++; }
+		else{ levelVotes++; }
+	}
+	const bool pitchWindowReady = (pitchSampleCount == PITCH_WINDOW_SAMPLE_COUNT);
+	const bool uphillSlope = pitchWindowReady && uphillVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
+	const bool downhillSlope = pitchWindowReady && downhillVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
+	const bool levelGround = pitchWindowReady && levelVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
 	/* 【坡度控制】计算 Y 的 5 次滑动平均，供方向纠偏使用。
 	 * Rolling mean of the latest five raw Y readings, updated every call.
 	 * Wait for a complete window after startup/reset before correcting.
@@ -165,8 +191,8 @@ void KobukiNavigationStatechart(
 		ySampleCount = 0;
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
 		unpausedState = APPROACH_RAMP;
-		stableSampleCounter = 0;
-		downhillSampleCounter = 0;
+		pitchSampleCount = 0;
+		pitchSampleIndex = 0;
 	}
 	else if (state == INITIAL
 		|| state == PAUSE_WAIT_BUTTON_RELEASE
@@ -174,8 +200,8 @@ void KobukiNavigationStatechart(
 		|| state == UNPAUSE_WAIT_BUTTON_RELEASE
 		|| sensors.buttons.B0				// pause button
 		){
-		stableSampleCounter = 0;
-		downhillSampleCounter = 0;
+		pitchSampleCount = 0;
+		pitchSampleIndex = 0;
 		switch (state){
 		case INITIAL:
 			ySampleSum = 0.0;
@@ -183,7 +209,6 @@ void KobukiNavigationStatechart(
 			ySampleCount = 0;
 			/* Start every run from the beginning of the straight course. */
 			unpausedState = APPROACH_RAMP;
-			stableSampleCounter = 0;
 			state = UNPAUSE_WAIT_BUTTON_PRESS; // place into pause state
 			break;
 		case PAUSE_WAIT_BUTTON_RELEASE:
@@ -214,7 +239,7 @@ void KobukiNavigationStatechart(
 	//*************************************
 	// state transition - run region      *
 	//*************************************
-	/* 【Cliff 状态切换】检测悬崖 -> 倒车 80 mm -> 转向 30° -> 恢复原阶段。
+	/* 【Cliff 状态切换】检测悬崖 -> 倒车达到距离阈值 -> 转向达到角度阈值 -> 恢复原阶段。
 	 * 优先于坡度状态切换；倒车、转向期间不重复触发同一避让动作。
 	 */
 	else if (cliffDetected
@@ -227,8 +252,8 @@ void KobukiNavigationStatechart(
 		stateBeforeCliff = state;
 		cliffTurnRight = sensors.cliffLeft || sensors.cliffCenter;
 		cliffStartDistance = netDistance;
-		stableSampleCounter = 0;
-		downhillSampleCounter = 0;
+		pitchSampleCount = 0;
+		pitchSampleIndex = 0;
 		state = CLIFF_BACKUP;
 	}
 	else if (state == CLIFF_BACKUP
@@ -240,27 +265,20 @@ void KobukiNavigationStatechart(
 		&& abs(netAngle - cliffStartAngle) >= CLIFF_TURN_ANGLE_DEG){
 		state = stateBeforeCliff;
 	}
-	/* 【坡度控制】连续 5 次检测到下坡，可从正常行驶阶段直接进入下坡。 */
+	/* 【坡度控制】最近 8 次中 7 次下坡，可从正常行驶阶段直接进入下坡。 */
 	else if (downhillSlope
 		&& state != DESCEND_RAMP
 		&& state != CLIFF_BACKUP
 		&& state != CLIFF_TURN_RIGHT
 		&& state != CLIFF_TURN_LEFT){
-		/* A stable negative pitch means the robot is facing downhill. */
-		stableSampleCounter = 0;
-		if (downhillSampleCounter < STABLE_SAMPLE_COUNT){
-			downhillSampleCounter++;
-		}
-		if (downhillSampleCounter >= STABLE_SAMPLE_COUNT){
-			state = DESCEND_RAMP;
-			downhillSampleCounter = 0;
-		}
+		state = DESCEND_RAMP;
+		pitchSampleCount = 0;
+		pitchSampleIndex = 0;
 	}
-	/* 【坡度控制】接近坡道 -> 上坡 -> 坡顶 -> 下坡 -> 平地，连续 5 次确认。 */
+	/* 【坡度控制】接近坡道 -> 上坡 -> 坡顶 -> 下坡 -> 平地，8 次中 7 次确认。 */
 	else{
 		bool transitionCondition = false;
 		robotState_t nextState = state;
-		downhillSampleCounter = 0;
 
 		switch (state){
 		case APPROACH_RAMP:
@@ -268,7 +286,7 @@ void KobukiNavigationStatechart(
 			nextState = CLIMB_RAMP;
 			break;
 		case CLIMB_RAMP:
-			transitionCondition = !onSlope;
+			transitionCondition = levelGround;
 			nextState = DRIVE_ACROSS_TOP;
 			break;
 		case DRIVE_ACROSS_TOP:
@@ -276,7 +294,7 @@ void KobukiNavigationStatechart(
 			nextState = DESCEND_RAMP;
 			break;
 		case DESCEND_RAMP:
-			transitionCondition = !onSlope;
+			transitionCondition = levelGround;
 			nextState = DRIVE_ON_LEVEL;
 			break;
 		default:
@@ -285,16 +303,9 @@ void KobukiNavigationStatechart(
 		}
 
 		if (transitionCondition){
-			if (stableSampleCounter < STABLE_SAMPLE_COUNT){
-				stableSampleCounter++;
-			}
-			if (stableSampleCounter >= STABLE_SAMPLE_COUNT){
-				state = nextState;
-				stableSampleCounter = 0;
-			}
-		}
-		else{
-			stableSampleCounter = 0;
+			state = nextState;
+			pitchSampleCount = 0;
+			pitchSampleIndex = 0;
 		}
 	}
 	// else, no transitions are taken
