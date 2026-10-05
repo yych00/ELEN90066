@@ -47,6 +47,7 @@ typedef enum{
 
 /* Keep the lateral acceleration near zero while travelling on a slope. */
 #define Y_ALIGNMENT_THRESHOLD_G	0.02
+#define Y_FILTER_SAMPLE_COUNT    5
 #define UPHILL_ALIGN_OUTER_SPEED_MM_S	140
 #define UPHILL_ALIGN_INNER_SPEED_MM_S	120
 #define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 70
@@ -108,6 +109,10 @@ void KobukiNavigationStatechart(
 	static bool					cliffTurnRight = true;
 	static double                   filteredPitchDeg = 0.0;
 	static bool                     pitchFilterInitialized = false;
+	static double                   ySamples[Y_FILTER_SAMPLE_COUNT] = {0};
+	static double                   ySampleSum = 0.0;
+	static int                      ySampleIndex = 0;
+	static int                      ySampleCount = 0;
 
 	// outputs
 	int16_t						leftWheelSpeed = 0;				// speed of the left wheel, in mm/s
@@ -138,6 +143,20 @@ void KobukiNavigationStatechart(
 	const bool uphillSlope = (pitchDeg >= PITCH_THRESHOLD_DEG);
 	const bool downhillSlope = (pitchDeg <= -PITCH_THRESHOLD_DEG);
 	const bool onSlope = uphillSlope || downhillSlope;
+	/* Rolling mean of the latest five raw Y readings, updated every call.
+	 * Wait for a complete window after startup/reset before correcting.
+	 */
+	if (ySampleCount == Y_FILTER_SAMPLE_COUNT){
+		ySampleSum -= ySamples[ySampleIndex];
+	}
+	else{
+		ySampleCount++;
+	}
+	ySamples[ySampleIndex] = accelAxes.y;
+	ySampleSum += accelAxes.y;
+	ySampleIndex = (ySampleIndex + 1) % Y_FILTER_SAMPLE_COUNT;
+	const bool yFilterReady = (ySampleCount == Y_FILTER_SAMPLE_COUNT);
+	const double filteredY = ySampleSum / ySampleCount;
 	const bool cliffDetected = sensors.cliffLeft
 		|| sensors.cliffCenter
 		|| sensors.cliffRight;
@@ -145,6 +164,9 @@ void KobukiNavigationStatechart(
 
 	/* B1 is a reset button: stop and require a fresh B0 press to start. */
 	if (sensors.buttons.B1){
+		ySampleSum = 0.0;
+		ySampleIndex = 0;
+		ySampleCount = 0;
 		pitchFilterInitialized = false;
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
 		unpausedState = APPROACH_RAMP;
@@ -161,6 +183,9 @@ void KobukiNavigationStatechart(
 		downhillSampleCounter = 0;
 		switch (state){
 		case INITIAL:
+			ySampleSum = 0.0;
+			ySampleIndex = 0;
+			ySampleCount = 0;
 			pitchFilterInitialized = false;
 			/* Start every run from the beginning of the straight course. */
 			unpausedState = APPROACH_RAMP;
@@ -339,31 +364,31 @@ void KobukiNavigationStatechart(
 	/*
 	 * Y = 0 has two possible headings: straight uphill or straight downhill.
 	 * The correction direction must therefore be reversed while descending.
-	 * Check Y on every call throughout the climb/descent state, without
-	 * pitch gating or sample confirmation. Returning to the Y deadband
-	 * immediately restores the state's normal straight-driving speed.
+	 * Check the five-sample Y mean on every call during climb/descent,
+	 * without pitch gating or an additional confirmation counter.
+	 * Returning to the mean's deadband restores normal straight speed.
 	 * Do not apply slope alignment on level-road states, where acceleration
 	 * spikes could otherwise make the robot turn back toward the ramp.
 	 */
-	if (state == CLIMB_RAMP){
-		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
+	if (state == CLIMB_RAMP && yFilterReady){
+		if (filteredY >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Uphill, positive Y: curve right. */
 			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
-		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
+		else if (filteredY <= -Y_ALIGNMENT_THRESHOLD_G){
 			/* Uphill, negative Y: curve left. */
 			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
-	else if (state == DESCEND_RAMP){
-		if (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G){
+	else if (state == DESCEND_RAMP && yFilterReady){
+		if (filteredY >= Y_ALIGNMENT_THRESHOLD_G){
 			/* Downhill, positive Y: curve left (opposite to uphill). */
 			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
-		else if (accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G){
+		else if (filteredY <= -Y_ALIGNMENT_THRESHOLD_G){
 			/* Downhill, negative Y: curve right (opposite to uphill). */
 			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
