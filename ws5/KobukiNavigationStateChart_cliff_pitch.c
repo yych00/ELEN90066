@@ -49,11 +49,12 @@ typedef enum{
 #define CLIFF_TURN_ANGLE_DEG		30  // 避让转向角度：30°
 
 /* 【坡度控制：Y 方向差速纠偏】只在上坡、下坡状态中生效。
- * 最近 5 次 Y 取平均，与 Y_ALIGNMENT_THRESHOLD_G 的正负阈值比较；不额外连续确认。
+ * 最近 5 次 Y 中至少 3 次同方向超过阈值就纠偏；不要求连续，不取平均。
  * 外侧轮比内侧轮快，左右轮的分配由纠偏方向决定。
  */
-#define Y_ALIGNMENT_THRESHOLD_G	0.01 // Y 平均值的纠偏阈值，单位 g
-#define Y_FILTER_SAMPLE_COUNT    5   // Y 滑动平均窗口，区别于 pitch 的 8 次中 7 次检测
+#define Y_ALIGNMENT_THRESHOLD_G	0.01 // 单次 Y 检测的纠偏阈值，单位 g
+#define Y_FILTER_SAMPLE_COUNT    5    // Y 检测滑动窗口
+#define Y_REQUIRED_SAMPLE_COUNT  3    // 至少 3 次同方向满足条件
 #define UPHILL_ALIGN_OUTER_SPEED_MM_S	200 // 上坡纠偏外侧轮
 #define UPHILL_ALIGN_INNER_SPEED_MM_S	150 // 上坡纠偏内侧轮
 #define DOWNHILL_ALIGN_OUTER_SPEED_MM_S 100 // 下坡纠偏外侧轮
@@ -115,8 +116,7 @@ void KobukiNavigationStatechart(
 	static int32_t				cliffStartDistance = 0;
 	static int32_t				cliffStartAngle = 0;
 	static bool					cliffTurnRight = true;
-	static double                   ySamples[Y_FILTER_SAMPLE_COUNT] = {0};
-	static double                   ySampleSum = 0.0;
+	static int                      ySamples[Y_FILTER_SAMPLE_COUNT] = {0};
 	static int                      ySampleIndex = 0;
 	static int                      ySampleCount = 0;
 
@@ -163,21 +163,25 @@ void KobukiNavigationStatechart(
 	const bool uphillSlope = pitchWindowReady && uphillVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
 	const bool downhillSlope = pitchWindowReady && downhillVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
 	const bool levelGround = pitchWindowReady && levelVotes >= PITCH_REQUIRED_SAMPLE_COUNT;
-	/* 【坡度控制】计算 Y 的 5 次滑动平均，供方向纠偏使用。
-	 * Rolling mean of the latest five raw Y readings, updated every call.
-	 * Wait for a complete window after startup/reset before correcting.
+	/* 【坡度控制】对最近 5 次原始 Y 分类投票：+1 正方向，-1 负方向，0 阈值内。
+	 * 收满 5 次后每次更新，至少 3 次同方向满足条件才纠偏。
 	 */
-	if (ySampleCount == Y_FILTER_SAMPLE_COUNT){
-		ySampleSum -= ySamples[ySampleIndex];
-	}
-	else{
+	if (ySampleCount < Y_FILTER_SAMPLE_COUNT){
 		ySampleCount++;
 	}
-	ySamples[ySampleIndex] = accelAxes.y;
-	ySampleSum += accelAxes.y;
+	ySamples[ySampleIndex] = (accelAxes.y >= Y_ALIGNMENT_THRESHOLD_G) ? 1
+		: ((accelAxes.y <= -Y_ALIGNMENT_THRESHOLD_G) ? -1 : 0);
 	ySampleIndex = (ySampleIndex + 1) % Y_FILTER_SAMPLE_COUNT;
 	const bool yFilterReady = (ySampleCount == Y_FILTER_SAMPLE_COUNT);
-	const double filteredY = ySampleSum / ySampleCount;
+	int positiveYVotes = 0;
+	int negativeYVotes = 0;
+	int yVoteIndex;
+	for (yVoteIndex = 0; yVoteIndex < ySampleCount; yVoteIndex++){
+		if (ySamples[yVoteIndex] == 1){ positiveYVotes++; }
+		else if (ySamples[yVoteIndex] == -1){ negativeYVotes++; }
+	}
+	const bool positiveYCorrection = yFilterReady && positiveYVotes >= Y_REQUIRED_SAMPLE_COUNT;
+	const bool negativeYCorrection = yFilterReady && negativeYVotes >= Y_REQUIRED_SAMPLE_COUNT;
 	/* 【Cliff 检测】左、中、右任一悬崖传感器触发即视为悬崖。 */
 	const bool cliffDetected = sensors.cliffLeft
 		|| sensors.cliffCenter
@@ -187,7 +191,6 @@ void KobukiNavigationStatechart(
 	/* 【通用按钮控制】B1 重置；B0 启动、暂停、恢复，优先于避让与坡度控制。
 	 * B1 is a reset button: stop and require a fresh B0 press to start. */
 	if (sensors.buttons.B1){
-		ySampleSum = 0.0;
 		ySampleIndex = 0;
 		ySampleCount = 0;
 		state = UNPAUSE_WAIT_BUTTON_PRESS;
@@ -205,7 +208,6 @@ void KobukiNavigationStatechart(
 		pitchSampleIndex = 0;
 		switch (state){
 		case INITIAL:
-			ySampleSum = 0.0;
 			ySampleIndex = 0;
 			ySampleCount = 0;
 			/* Start every run from the beginning of the straight course. */
@@ -377,31 +379,31 @@ void KobukiNavigationStatechart(
 	/* 【坡度控制动作：Y 差速纠偏】在基础轮速之后执行，覆盖两轮速度。
 	 * Y = 0 has two possible headings: straight uphill or straight downhill.
 	 * The correction direction must therefore be reversed while descending.
-	 * Check the five-sample Y mean on every call during climb/descent,
+	 * Check three-of-five same-direction Y votes on every call during climb/descent,
 	 * without pitch gating or an additional confirmation counter.
-	 * Returning to the mean's deadband restores normal straight speed.
+	 * When neither direction has three votes, restore normal straight speed.
 	 * Do not apply slope alignment on level-road states, where acceleration
 	 * spikes could otherwise make the robot turn back toward the ramp.
 	 */
 	if (state == CLIMB_RAMP && yFilterReady){
-		if (filteredY >= Y_ALIGNMENT_THRESHOLD_G){
+		if (positiveYCorrection){
 			/* Uphill, positive Y: curve right. */
 			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 		}
-		else if (filteredY <= -Y_ALIGNMENT_THRESHOLD_G){
+		else if (negativeYCorrection){
 			/* Uphill, negative Y: curve left. */
 			leftWheelSpeed = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
 	}
 	else if (state == DESCEND_RAMP && yFilterReady){
-		if (filteredY >= Y_ALIGNMENT_THRESHOLD_G){
+		if (positiveYCorrection){
 			/* Downhill, positive Y: curve left (opposite to uphill). */
 			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 		}
-		else if (filteredY <= -Y_ALIGNMENT_THRESHOLD_G){
+		else if (negativeYCorrection){
 			/* Downhill, negative Y: curve right (opposite to uphill). */
 			leftWheelSpeed = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
 			rightWheelSpeed = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
