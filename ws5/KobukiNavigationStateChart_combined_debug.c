@@ -14,6 +14,7 @@
  * 默认 myRIO 1900；1950 工程定义 MyRio_1950。桌面纯仿真可定义 DEBUG_ENABLE_LED=0。
  * isSimulator=true 时不访问硬件；本文件不打开或关闭调用方的 FPGA 会话。
  */
+#include <stdint.h>
 #include "KobukiNavigationStateChart.h"
 #include <math.h>
 #include <stdlib.h>
@@ -169,8 +170,10 @@ static bool onGround(const routePhase_t phase)
     return phase == APPROACH_RAMP || phase == FINISH_STRAIGHT;
 }
 
-/* 【状态灯码】停车锁止优先于按钮状态；暂停时隐藏尚未完成的避让动作。 */
-static uint8_t debugLedMask(const navigation_t * const nav)
+/* 【状态灯码】停车锁止优先于按钮状态；暂停时隐藏尚未完成的避让动作。
+ * 灯码仅占低四位，用标准 C 的 unsigned char，避免依赖 uint8_t 的类型索引。
+ */
+static unsigned char debugLedMask(const navigation_t * const nav)
 {
     if (nav->phase == FINISHED) { return 0x0F; }
     if (nav->button != RUNNING) { return 0x00; }
@@ -198,10 +201,10 @@ static uint8_t debugLedMask(const navigation_t * const nav)
  */
 static void updateDebugLeds(const navigation_t * const nav, const bool isSimulator)
 {
-    uint8_t mask = debugLedMask(nav);
+    unsigned char mask = debugLedMask(nav);
 #if DEBUG_ENABLE_LED
     static bool haveWritten = false;
-    static uint8_t lastMask = 0;
+    static unsigned char lastMask = 0;
     NiFpga_Status status;
     if (isSimulator) { haveWritten = false; return; }
     if (haveWritten && mask == lastMask) { return; }
