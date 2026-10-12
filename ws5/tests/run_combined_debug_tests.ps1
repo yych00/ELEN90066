@@ -17,6 +17,8 @@ $scenarios = @(
     'backup_distance_overflow', 'cliff_distance_overflow',
     'obstacle_left', 'obstacle_right', 'obstacle_center', 'overshoot',
     'angle_wrap', 'ramp_during_clear', 'finished_latch', 'reset_held_button', 'speed_cap',
+    'approach_heading_target', 'clear_heading_hold', 'clear_distance_direction',
+    'repeated_collision_heading',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
 )
