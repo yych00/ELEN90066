@@ -2,7 +2,10 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include "../KobukiNavigationStateChart_combined.c"
+#ifndef COMBINED_CONTROLLER_SOURCE
+#define COMBINED_CONTROLLER_SOURCE "../KobukiNavigationStateChart_combined.c"
+#endif
+#include COMBINED_CONTROLLER_SOURCE
 
 static KobukiSensors_t input;
 static accelerometer_t acceleration;
