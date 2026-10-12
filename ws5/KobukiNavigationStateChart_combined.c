@@ -20,35 +20,35 @@
 #define Y_REQUIRED_SAMPLE_COUNT          3
 
 /* 【路线轮速】先按阶段选择，再应用 Y 纠偏和固定轮速补偿。 */
-#define APPROACH_SPEED_MM_S              200
-#define CLIMB_SPEED_MM_S                 200
-#define TOP_SPEED_MM_S                   150
-#define DESCEND_SPEED_MM_S               100
-#define FINISH_SPEED_MM_S                200
+#define APPROACH_SPEED_MM_S              400
+#define CLIMB_SPEED_MM_S                 400
+#define TOP_SPEED_MM_S                   300
+#define DESCEND_SPEED_MM_S               200
+#define FINISH_SPEED_MM_S                400
 #ifndef FINISH_DISTANCE_MM
 #define FINISH_DISTANCE_MM               200  /* 下坡确认平地后，正常直行的距离 */
 #endif
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S    200
-#define UPHILL_ALIGN_INNER_SPEED_MM_S    150
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  100
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  75
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S    400
+#define UPHILL_ALIGN_INNER_SPEED_MM_S    300
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  200
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  150
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
 #define OBSTACLE_CLEAR_DISTANCE_MM       300
 #define OBSTACLE_TURN_ANGLE_DEG          80
-#define OBSTACLE_REVERSE_SPEED_MM_S      120
-#define OBSTACLE_TURN_SPEED_MM_S         110
+#define OBSTACLE_REVERSE_SPEED_MM_S      240
+#define OBSTACLE_TURN_SPEED_MM_S         220
 #define HEADING_TOLERANCE_DEG            5
-#define REORIENT_MIN_SPEED_MM_S          20
-#define REORIENT_GAIN_MM_S_PER_DEG       3
+#define REORIENT_MIN_SPEED_MM_S          40
+#define REORIENT_GAIN_MM_S_PER_DEG       6
 
 /* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
 #define CLIFF_TURN_ANGLE_DEG              30
-#define CLIFF_BACKUP_FAST_MM_S           80
-#define CLIFF_BACKUP_SLOW_MM_S           50
-#define CLIFF_TURN_SPEED_MM_S            80
+#define CLIFF_BACKUP_FAST_MM_S           160
+#define CLIFF_BACKUP_SLOW_MM_S           100
+#define CLIFF_TURN_SPEED_MM_S            160
 #ifndef WHEEL_SPEED_TRIM
 #define WHEEL_SPEED_TRIM                 0.00 /* 负值补左轮，正值补右轮 */
 #endif
