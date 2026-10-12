@@ -1,35 +1,14 @@
 /*
- * WS5 + 地面避障完整控制器：板载 LED 调试版。
- * 加速度单位 g，距离 mm，轮速 mm/s；行驶逻辑和两倍轮速与 combined.c 相同。
+ * WS5 + 地面避障完整控制器：调试工程使用版本。
+ * 行驶逻辑和两倍轮速与 combined.c 相同；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
  * 本文件替换工程中的原状态机源文件，不与其他同名接口实现一起编译。
- * LED3..LED0 为四位状态码，1 表示亮，0 表示灭：
- * 0000 等待/暂停/重置；0001 平面接近；0010 上坡；0011 坡顶；
- * 0100 下坡；0101 终点平面直行；1111 终点停车锁止；
- * 0110 避障倒车；0111 避障转向；1000 绕障前进；1001 回正；
- * 1010 悬崖倒车；1011 悬崖转向。避让动作优先显示，结束后恢复路线灯码。
- * 每次状态变化直接写入新灯码，使旧灯灭、新灯亮；保持显示，不插入延时。
- * 工程需包含 myRIO 头文件路径，链接已有 MyRio/NiFpga 实现；调用方先 MyRio_Open()。
- * 默认 myRIO 1900；1950 工程定义 MyRio_1950。桌面纯仿真可定义 DEBUG_ENABLE_LED=0。
- * isSimulator=true 时不访问硬件；本文件不打开或关闭调用方的 FPGA 会话。
  */
-#include <stdint.h>
 #include "KobukiNavigationStateChart.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifndef DEBUG_ENABLE_LED
-#define DEBUG_ENABLE_LED                 1
-#endif
-#if DEBUG_ENABLE_LED
-#if !defined(MyRio_1900) && !defined(MyRio_1950)
-#define MyRio_1900
-#endif
-#include "MyRio.h"
-extern NiFpga_Session myrio_session;
-#endif
 
 /* 【坡度判断】原始读数投票，不平均、不要求连续满足。 */
 #define RAD_TO_DEG                       57.29577951308232
@@ -170,55 +149,6 @@ static bool onGround(const routePhase_t phase)
     return phase == APPROACH_RAMP || phase == FINISH_STRAIGHT;
 }
 
-/* 【状态灯码】停车锁止优先于按钮状态；暂停时隐藏尚未完成的避让动作。
- * 灯码仅占低四位，用标准 C 的 unsigned char，避免依赖 uint8_t 的类型索引。
- */
-static unsigned char debugLedMask(const navigation_t * const nav)
-{
-    if (nav->phase == FINISHED) { return 0x0F; }
-    if (nav->button != RUNNING) { return 0x00; }
-    switch (nav->motion) {
-    case OBSTACLE_BACKUP:   return 0x06;
-    case OBSTACLE_TURN:     return 0x07;
-    case OBSTACLE_CLEAR:    return 0x08;
-    case OBSTACLE_REORIENT: return 0x09;
-    case CLIFF_BACKUP:      return 0x0A;
-    case CLIFF_TURN:        return 0x0B;
-    default:               break;
-    }
-    switch (nav->phase) {
-    case APPROACH_RAMP:    return 0x01;
-    case CLIMB_RAMP:       return 0x02;
-    case DRIVE_ACROSS_TOP: return 0x03;
-    case DESCEND_RAMP:     return 0x04;
-    case FINISH_STRAIGHT:  return 0x05;
-    default:              return 0x00;
-    }
-}
-
-/* 【LED 亮灭】首次调用或显示变化时写寄存器，避免每个控制周期重复写。
- * 写失败不更新缓存，下一周期重试；不影响轮速和路线状态，不做阻塞等待。
- */
-static void updateDebugLeds(const navigation_t * const nav, const bool isSimulator)
-{
-    unsigned char mask = debugLedMask(nav);
-#if DEBUG_ENABLE_LED
-    static bool haveWritten = false;
-    static unsigned char lastMask = 0;
-    NiFpga_Status status;
-    if (isSimulator) { haveWritten = false; return; }
-    if (haveWritten && mask == lastMask) { return; }
-    status = NiFpga_WriteU8(myrio_session, DOLED30, mask);
-    if (status >= NiFpga_Status_Success) {
-        lastMask = mask;
-        haveWritten = true;
-    }
-#else
-    (void)mask;
-    (void)isSimulator;
-#endif
-}
-
 /* 【坡度判断】横着处于斜坡不能算平地；过小/过大的合加速度不投有效票。 */
 static slopeSample_t classifySlope(const accelerometer_t accel)
 {
@@ -332,7 +262,7 @@ static void beginCliff(navigation_t * const nav, const KobukiSensors_t sensors,
 /* 【统一输出与终点计距】只把正常直行命令覆盖的区间标为可累计。 */
 static void outputSpeeds(navigation_t * const nav, const int16_t left,
     const int16_t right, const int16_t maximum, const int32_t distance,
-    int16_t * const pRight, int16_t * const pLeft, const bool isSimulator)
+    int16_t * const pRight, int16_t * const pLeft)
 {
     *pLeft = trimWheelSpeed(left, WHEEL_SPEED_TRIM < 0 ? -WHEEL_SPEED_TRIM : 0, maximum);
     *pRight = trimWheelSpeed(right, WHEEL_SPEED_TRIM > 0 ? WHEEL_SPEED_TRIM : 0, maximum);
@@ -340,7 +270,6 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     nav->countFinishDistance = nav->phase == FINISH_STRAIGHT
         && nav->button == RUNNING && nav->motion == ROUTE_DRIVE
         && *pLeft > 0 && *pRight > 0;
-    updateDebugLeds(nav, isSimulator);
 }
 
 void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
@@ -359,6 +288,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
     bool turnCompleted;
+    (void)isSimulator;
 
     /* B1 重置后仍为停车等待状态，必须重新按下并松开 B0。 */
     if (!nav.initialized || sensors.buttons.B1) {
@@ -366,7 +296,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         /* 重置时若 B0 已按住，先等它释放，避免把旧按键当成新启动。 */
         if (sensors.buttons.B0) { nav.button = WAIT_PAUSE_RELEASE; }
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
-            pRightWheelSpeed, pLeftWheelSpeed, isSimulator);
+            pRightWheelSpeed, pLeftWheelSpeed);
         return;
     }
 
@@ -386,7 +316,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     /* 【终点锁止】优先于 B0、bumper 和悬崖；任何输入都不能自动复跑。 */
     if (nav.phase == FINISHED) {
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
-            pRightWheelSpeed, pLeftWheelSpeed, isSimulator);
+            pRightWheelSpeed, pLeftWheelSpeed);
         return;
     }
 
@@ -411,7 +341,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     }
     if (nav.button != RUNNING) {
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
-            pRightWheelSpeed, pLeftWheelSpeed, isSimulator);
+            pRightWheelSpeed, pLeftWheelSpeed);
         return;
     }
 
@@ -527,5 +457,5 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         break;
     }
     outputSpeeds(&nav, left, right, maxWheelSpeed, netDistance,
-        pRightWheelSpeed, pLeftWheelSpeed, isSimulator);
+        pRightWheelSpeed, pLeftWheelSpeed);
 }
