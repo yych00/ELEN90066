@@ -20,7 +20,9 @@ $scenarios = @(
     'finish_pause', 'finish_obstacle', 'finish_cliff', 'persistent_cliff',
     'cliff_interrupts_obstacle', 'resume_bumper', 'persistent_bumper',
     'obstacle_left', 'obstacle_right', 'obstacle_center', 'overshoot',
-    'angle_wrap', 'ramp_during_clear', 'finished_latch', 'reset_held_button', 'speed_cap'
+    'angle_wrap', 'ramp_during_clear', 'finished_latch', 'reset_held_button', 'speed_cap',
+    'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
+    'course_jitter', 'course_capped200', 'course_wheel_drift'
 )
 try {
     foreach ($standard in @('gnu89', 'c99')) {

@@ -96,6 +96,101 @@ static void resumeAt(const int32_t distance, const int32_t angle)
     tick(distance, angle);
 }
 
+/* 连续课程模型：轮速推动位置与里程，再由当前位置产生地形/碰撞读数。
+ * 这是独立的理想差速模型，轮距 230 mm；不代表实机摩擦、惯性或制动性能。
+ * 地面障碍位于 x=260..400、|y|<=70；上坡 700..1600，坡顶 1600..2600，
+ * 下坡 2600..3500，后面为终点平面。所有传感器都通过公开接口送入。
+ */
+static void fullCourse(const char * const profile)
+{
+    int step;
+    int courseSteps;
+    int32_t odometer = 0;
+    int32_t headingDegrees = 0;
+    double x = 0, y = 0, heading = 0, distance = 0, elapsed = 0;
+    double dt, leftActual, rightActual, linear, angular, slope;
+    double finishStart = -1;
+    double largestStep = 0;
+    double maximumPeriod = 0;
+    bool sawBackup = false, sawTurn = false, sawClimb = false;
+    bool sawTop = false, sawDescent = false, stopped = false;
+    bool limited = strcmp(profile, "course_capped200") == 0;
+    bool drift = strcmp(profile, "course_wheel_drift") == 0;
+
+    if (limited) { maximum = 200; start(0); }
+    for (step = 0; step < 10000; step++) {
+        dt = 0.064;
+        if (strcmp(profile, "course_20ms") == 0) { dt = 0.020; }
+        else if (strcmp(profile, "course_100ms") == 0) { dt = 0.100; }
+        else if (strcmp(profile, "course_250ms") == 0) { dt = 0.250; }
+        else if (strcmp(profile, "course_jitter") == 0) {
+            dt = step % 3 == 0 ? 0.020 : (step % 3 == 1 ? 0.064 : 0.128);
+        }
+        if (dt > maximumPeriod) { maximumPeriod = dt; }
+        leftActual = leftSpeed * (drift ? 0.99 : 1.0);
+        rightActual = rightSpeed * (drift ? 1.01 : 1.0);
+        linear = (leftActual + rightActual) / 2;
+        angular = (rightActual - leftActual) / 230.0;
+        x += linear * cos(heading + angular * dt / 2) * dt;
+        y += linear * sin(heading + angular * dt / 2) * dt;
+        heading += angular * dt;
+        distance += linear * dt;
+        if (linear * dt > largestStep) { largestStep = linear * dt; }
+        odometer = (int32_t)(distance >= 0 ? distance + 0.5 : distance - 0.5);
+        headingDegrees = (int32_t)(heading >= 0
+            ? heading * RAD_TO_DEG + 0.5 : heading * RAD_TO_DEG - 0.5);
+
+        memset(&input, 0, sizeof(input));
+        elapsed += dt;
+        input.TimeStamp = (uint16_t)(int64_t)(elapsed * 1000);
+        input.bumps_wheelDrops.bumpCenter = x >= 260 && x <= 400 && fabs(y) <= 70;
+        /* 爬坡已确认后的坡面故意拉高 bumper，验证不误入地面避障。 */
+        if (x >= 1450 && x < 2700) { input.bumps_wheelDrops.bumpCenter = true; }
+        slope = x >= 700 && x < 1600 ? 15.0
+            : (x >= 2600 && x < 3500 ? -15.0 : 0.0);
+        acceleration.x = sin(slope / RAD_TO_DEG) * cos(heading);
+        acceleration.y = sin(slope / RAD_TO_DEG) * sin(heading);
+        acceleration.z = cos(slope / RAD_TO_DEG);
+        tick(odometer, headingDegrees);
+
+        if (x < 700 && leftSpeed < 0 && rightSpeed < 0) { sawBackup = true; }
+        if (x < 700 && ((leftSpeed < 0 && rightSpeed > 0)
+            || (leftSpeed > 0 && rightSpeed < 0))) { sawTurn = true; }
+        if (x >= 1450 && x < 1600 && leftSpeed > 0 && rightSpeed > 0) {
+            sawClimb = true;
+        }
+        if (x >= 1600 && x < 2600 && leftSpeed == rightSpeed
+            && leftSpeed == (limited ? 200 : 300)) { sawTop = true; }
+        if (x >= 2600 && x < 3500 && leftSpeed > 0 && rightSpeed > 0
+            && leftSpeed <= 200 && rightSpeed <= 200) { sawDescent = true; }
+        if (!limited && x >= 3500 && leftSpeed == 400 && rightSpeed == 400
+            && finishStart < 0) { finishStart = odometer; }
+        if (x >= 3500 && leftSpeed == 0 && rightSpeed == 0) {
+            stopped = true;
+            break;
+        }
+    }
+    assert(sawBackup && sawTurn && sawClimb && sawTop && sawDescent && stopped);
+    courseSteps = step + 1;
+    /* 不把最初平面/坡顶当终点，且到最终平面后不会无限继续跑。 */
+    assert(x >= 3500 && x <= 3500 + 200 * maximumPeriod * 8 + 200 + largestStep + 10);
+    if (!limited) {
+        assert(finishStart >= 0);
+        assert(odometer - finishStart >= 200);
+        assert(odometer - finishStart <= 200 + largestStep + 1);
+    }
+    /* 连续按 B0、改变坡度、同时触发 bumper/cliff 都不能解除终点锁止。 */
+    for (step = 0; step < 12; step++) {
+        input.buttons.B0 = step % 2 == 0;
+        input.cliffLeft = input.bumps_wheelDrops.bumpLeft = true;
+        terrain(-15, 0);
+        tick(odometer, headingDegrees);
+        expect(0, 0);
+    }
+    printf("COURSE %s: avoid -> climb -> top -> descend -> stop; x=%.1f mm, steps=%d\n",
+        profile, x, courseSteps);
+}
+
 int main(int argc, char **argv)
 {
     int i;
@@ -106,7 +201,10 @@ int main(int argc, char **argv)
     if (argc >= 3) { simulator = strcmp(argv[2], "simulator") == 0; }
     start(0);
 
-    if (strcmp(argv[1], "route_stop") == 0) {
+    if (strncmp(argv[1], "course_", 7) == 0) {
+        fullCourse(argv[1]);
+    }
+    else if (strcmp(argv[1], "route_stop") == 0) {
         /* 初始地面不能停车，坡顶也不能作为终点。 */
         terrain(0, 0); samples(20, 0, 0); expect(400, 400);
         climb();
