@@ -126,6 +126,18 @@ static int32_t signedAngleError(const int32_t current, const int32_t target)
     return error;
 }
 
+/* 【倒车完成判据】兼容倒车时里程递减的净里程，以及始终递增的累计里程。
+ * 距离达到阈值立即切换转向，不依赖计数方向；先升为 int64 再取绝对值，
+ * 避免两个 int32 读数相减或 abs(INT32_MIN) 溢出。里程仍需由调用方更新。
+ */
+static bool backupDistanceReached(const int32_t current, const int32_t start,
+    const int32_t required)
+{
+    int64_t travelled = (int64_t)current - start;
+    if (travelled < 0) { travelled = -travelled; }
+    return travelled >= required;
+}
+
 /* 暂停、避让、路线切换后重新收满窗口，不沿用旧的坡度或 Y 证据。 */
 static void resetVotes(navigation_t * const nav)
 {
@@ -353,7 +365,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         updateRoute(&nav, accelAxes, netAngle);
     }
     if (nav.motion == CLIFF_BACKUP
-        && (int64_t)nav.maneuverDistance - netDistance >= CLIFF_BACKUP_DISTANCE_MM) {
+        && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
         nav.maneuverAngle = netAngle;
         nav.motion = CLIFF_TURN;
     }
@@ -376,7 +388,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             beginObstacle(&nav, sensors, netDistance, netAngle);
         }
         else if (nav.motion == OBSTACLE_BACKUP
-            && (int64_t)nav.maneuverDistance - netDistance >= OBSTACLE_BACKUP_DISTANCE_MM) {
+            && backupDistanceReached(netDistance, nav.maneuverDistance, OBSTACLE_BACKUP_DISTANCE_MM)) {
             nav.maneuverAngle = netAngle;
             nav.motion = OBSTACLE_TURN;
         }

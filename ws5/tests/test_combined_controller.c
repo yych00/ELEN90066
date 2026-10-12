@@ -99,6 +99,30 @@ static void resumeAt(const int32_t distance, const int32_t angle)
     tick(distance, angle);
 }
 
+/* 同一倒车动作分别输入递增/递减里程，检查到距离阈值就转向。
+ * 碰撞/悬崖信号保持或解除都不能反复重置倒车起点。
+ */
+static void checkBackupCounter(const bool cliff, const int32_t origin,
+    const int direction, const bool releaseSensor)
+{
+    int travelled;
+    int threshold = cliff ? 60 : 120;
+    start(0);
+    tick(origin, 0);
+    input.cliffLeft = cliff;
+    input.bumps_wheelDrops.bumpLeft = !cliff;
+    tick(origin, 0);
+    if (releaseSensor) {
+        input.cliffLeft = input.bumps_wheelDrops.bumpLeft = false;
+    }
+    for (travelled = 0; travelled < threshold; travelled++) {
+        tick(origin + direction * travelled, 0);
+        expect(cliff ? -100 : -240, cliff ? -160 : -240);
+    }
+    tick(origin + direction * threshold, 0);
+    expect(cliff ? 160 : 220, cliff ? -160 : -220);
+}
+
 /* 连续课程模型：轮速推动位置与里程，再由当前位置产生地形/碰撞读数。
  * 这是独立的理想差速模型，轮距 230 mm；不代表实机摩擦、惯性或制动性能。
  * 地面障碍位于 x=260..400、|y|<=70；上坡 700..1600，坡顶 1600..2600，
@@ -328,6 +352,33 @@ int main(int argc, char **argv)
         tick(0, 0); tick(-120, 0); expect(220, -220);
         tick(-120, -80); expect(-240, -240);
         tick(-239, -80); expect(-240, -240);
+    }
+    else if (strcmp(argv[1], "backup_increasing_distance") == 0) {
+        checkBackupCounter(false, 0, 1, false);
+    }
+    else if (strcmp(argv[1], "cliff_increasing_distance") == 0) {
+        checkBackupCounter(true, 0, 1, false);
+    }
+    else if (strcmp(argv[1], "backup_start_offsets") == 0) {
+        checkBackupCounter(false, 1000, 1, true);
+        checkBackupCounter(false, -1000, 1, false);
+        checkBackupCounter(false, 1000, -1, false);
+        checkBackupCounter(false, -1000, -1, true);
+    }
+    else if (strcmp(argv[1], "cliff_start_offsets") == 0) {
+        checkBackupCounter(true, 1000, 1, true);
+        checkBackupCounter(true, -1000, 1, false);
+        checkBackupCounter(true, 1000, -1, false);
+        checkBackupCounter(true, -1000, -1, true);
+    }
+    else if (strcmp(argv[1], "backup_distance_overflow") == 0
+        || strcmp(argv[1], "cliff_distance_overflow") == 0) {
+        /* 两个 int32 读数相减时，先转为 int64，避免 abs(INT32_MIN) 溢出。 */
+        input.cliffLeft = strcmp(argv[1], "cliff_distance_overflow") == 0;
+        input.bumps_wheelDrops.bumpLeft = !input.cliffLeft;
+        tick(0, 0);
+        tick(INT32_MIN, 0);
+        expect(input.cliffLeft ? 160 : 220, input.cliffLeft ? -160 : -220);
     }
     else if (strcmp(argv[1], "obstacle_left") == 0
         || strcmp(argv[1], "obstacle_right") == 0
