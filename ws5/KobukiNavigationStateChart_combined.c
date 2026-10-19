@@ -277,7 +277,7 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     /* 【拿到下坡 flag 后的平地持续检测】
      * 只要已获得下坡 flag，在平地上全程持续检测；
      * 当车身脱离下坡（最新样本为平地）时持续累加；当下坡时清零。
-     * 连续 3 拍或窗口满 4 票平地，直接判定到达平地停车锁止。
+     * 连续 6 拍或窗口满 6 票平地，直接判定到达平地停车锁止。
      */
     if (nav->downhillFlag) {
         if (currentSample == SAMPLE_LEVEL) {
@@ -286,7 +286,7 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         else if (currentSample == SAMPLE_DOWNHILL) {
             nav->levelGroundCount = 0;
         }
-        if (nav->levelGroundCount >= 3 || level >= 4) {
+        if (nav->levelGroundCount >= 6 || level >= 6) {
             next = FINISHED;
         }
     }
@@ -303,7 +303,7 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         if (down >= 4) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (nav->downhillFlag && (nav->levelGroundCount >= 3 || level >= 4)) {
+        if (nav->downhillFlag && (nav->levelGroundCount >= 6 || level >= 6)) {
             next = FINISHED;
         }
         break;
