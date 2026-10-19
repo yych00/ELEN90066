@@ -29,8 +29,6 @@
 #define Y_ALIGNMENT_THRESHOLD_G          0.01
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
-#define Y_CORRECTION_MAX_DURATION_MS     2000  /* 持续纠偏最大时间：2秒超时强制退出 */
-#define Y_CORRECTION_COOLDOWN_MS         1000  /* 超时退出后的平稳直行冷却时间 */
 
 /* 【路线轮速】基础值已降至原来的 70%，先选阶段，再应用纠偏和固定补偿。 */
 #define APPROACH_SPEED_MM_S              280
@@ -48,7 +46,7 @@
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
-#define OBSTACLE_CLEAR_DISTANCE_MM       300
+#define OBSTACLE_CLEAR_DISTANCE_MM       240
 #define OBSTACLE_TURN_ANGLE_DEG          80
 #define OBSTACLE_REVERSE_SPEED_MM_S      168
 #define OBSTACLE_TURN_SPEED_MM_S         154
@@ -136,8 +134,6 @@ typedef struct {
     int ySamples[Y_FILTER_SAMPLE_COUNT];
     int yIndex;
     int yCount;
-    int32_t yCorrectionDurationMs;
-    int32_t yCooldownMs;
     int32_t lastTimeStamp; /* 用有符号 32 位保存完整的 16 位时间戳。 */
 } navigation_t;
 
@@ -177,14 +173,11 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 暂停、地面碰撞、路线切换后重新收满坡度和 Y 窗口。 */
+/* 暂停、地面碰撞、路线切换后重新收满坡度窗口；参考 cliff_pitch.c 保留 Y 滤波滑动窗口。 */
 static void resetVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
     nav->pitchIndex = nav->pitchCount = 0;
-    nav->yIndex = nav->yCount = 0;
-    nav->yCorrectionDurationMs = 0;
-    nav->yCooldownMs = 0;
 }
 
 static void resetRun(navigation_t * const nav, const int32_t distance,
@@ -203,15 +196,12 @@ static bool onGround(const routePhase_t phase)
 }
 
 /* 【悬崖窗口】坡道上保留坡度票和写入位置，避免下坡/落地确认反复重来。
- * 入口确认、Y 投票与纠偏计时均清除；地面仍丢弃未确认的坡度证据。
+ * 地面仍丢弃未确认的坡度证据。参考 cliff_pitch.c，悬崖动作不打乱 Y 滑动窗口。
  * 悬崖倒车和转向期间不调用 updateRoute，不会写入新的坡度票。
  */
 static void resetCliffVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
-    nav->yIndex = nav->yCount = 0;
-    nav->yCorrectionDurationMs = 0;
-    nav->yCooldownMs = 0;
     if (onGround(nav->phase)) {
         nav->pitchIndex = nav->pitchCount = 0;
     }
@@ -427,24 +417,16 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
 {
     static navigation_t nav;
     int16_t left = 0, right = 0, speed;
-    int correction;
+    int correction = 0;
     int32_t error;
     int32_t reorientSpeed;
     int64_t delta;
-    int32_t dtMs = 64;
-    int32_t timeStampDiff;
     bool cliff = sensors.cliffLeft || sensors.cliffCenter || sensors.cliffRight;
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
     bool turnCompleted;
     (void)isSimulator;
 
-    if (sensors.TimeStamp != 0 && nav.lastTimeStamp != 0) {
-        timeStampDiff = (int32_t)sensors.TimeStamp - nav.lastTimeStamp;
-        /* 传感器时间戳从 65535 回到 0 时，显式补回一圈，代替无符号回绕。 */
-        if (timeStampDiff < 0) { timeStampDiff += 65536L; }
-        if (timeStampDiff > 0 && timeStampDiff < 500) { dtMs = timeStampDiff; }
-    }
     nav.lastTimeStamp = sensors.TimeStamp;
 
     /* B1 重置后仍为停车等待状态，必须重新按下并松开 B0。 */
@@ -603,43 +585,39 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.phase == DESCEND_RAMP) { speed = DESCEND_SPEED_MM_S; }
         else if (nav.phase == FINISH_STRAIGHT) { speed = FINISH_SPEED_MM_S; }
         left = right = limitSpeed(speed, maxWheelSpeed);
-        if (nav.phase == CLIMB_RAMP || nav.phase == DESCEND_RAMP) {
-            if (nav.yCooldownMs > 0) {
-                if (nav.yCooldownMs > dtMs) { nav.yCooldownMs -= dtMs; }
-                else { nav.yCooldownMs = 0; }
-                correction = 0;
+        /* 【坡度控制动作：Y 差速纠偏】完全参考 cliff_pitch.c
+         * 在基础轮速之后执行；最近 5 次 Y 中至少 3 次同方向超过阈值就纠偏。
+         * 无超时与冷却限制，车身回正自然恢复直行。下坡时纠偏方向相反。
+         */
+        if (nav.phase == CLIMB_RAMP) {
+            correction = updateY(&nav, accelAxes.y);
+            if (correction > 0) {
+                /* 上坡 Y 正向：右转（左轮外侧快，右轮内侧慢） */
+                left = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+                right = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
             }
-            else {
-                correction = updateY(&nav, accelAxes.y);
-                if (correction != 0) {
-                    nav.yCorrectionDurationMs += dtMs;
-                    if (nav.yCorrectionDurationMs >= Y_CORRECTION_MAX_DURATION_MS) {
-                        /* 持续纠偏满 2 秒：强制退出差速并重置采样窗口，进入平稳直行冷却 */
-                        correction = 0;
-                        nav.yIndex = nav.yCount = 0;
-                        nav.yCorrectionDurationMs = 0;
-                        nav.yCooldownMs = Y_CORRECTION_COOLDOWN_MS;
-                    }
-                }
-                else {
-                    /* 自然退出差速：Y轴回正，重置纠偏持续时间 */
-                    nav.yCorrectionDurationMs = 0;
-                }
+            else if (correction < 0) {
+                /* 上坡 Y 负向：左转（左轮内侧慢，右轮外侧快） */
+                left = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+                right = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
             }
-            if (correction != 0) {
-                if (nav.phase == CLIMB_RAMP) {
-                    left = limitSpeed(correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S
-                        : UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-                    right = limitSpeed(correction > 0 ? UPHILL_ALIGN_INNER_SPEED_MM_S
-                        : UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-                }
-                else {
-                    left = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_INNER_SPEED_MM_S
-                        : DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-                    right = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_OUTER_SPEED_MM_S
-                        : DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-                }
+        }
+        else if (nav.phase == DESCEND_RAMP) {
+            correction = updateY(&nav, accelAxes.y);
+            if (correction > 0) {
+                /* 下坡 Y 正向：左转（左轮内侧慢，右轮外侧快，与上坡相反） */
+                left = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+                right = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
             }
+            else if (correction < 0) {
+                /* 下坡 Y 负向：右转（左轮外侧快，右轮内侧慢，与上坡相反） */
+                left = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+                right = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+            }
+        }
+        else if (nav.phase == APPROACH_RAMP) {
+            /* 接近坡道平地行驶时持续滑动更新 Y 读数，确保切入上坡时窗口已就绪 */
+            (void)updateY(&nav, accelAxes.y);
         }
         break;
     case OBSTACLE_BACKUP:
