@@ -1,12 +1,9 @@
 /*
- * WS5 + 地面避障完整控制器：版本 1.0。
- * 版本来源：GitHub ws5/KobukiNavigationStateChart_combined_debug.c。
- * 本版本同步覆盖到 KobukiNavigationStateChart_combined.c，两个文件内容一致。
- * 【1.0 已知问题（实机反馈，待排查修复）】
- * 1. 下坡到达平地后没有停车。
- * 2. 上坡、下坡时未观察到 Y 轴检测/纠偏生效。
- * 注意：源码已有平地定距停车及 Y 轴检测分支，上述现象的原因尚未确认。
- * 本次仅标注版本、记录问题并同步文件，不表示上述问题已修复。
+ * WS5 + 地面避障完整控制器：版本 1.1，combined.c 保留 1.0 对照。
+ * 修复：绕行可确认上坡；限速保留 Y 差速；回正越过目标后反向；终点计距支持回绕。
+ * 加速度提供单位、轴映射及安装偏角配置，未知实机输入时保留默认 g 单位。
+ * Eclipse 可查看 kobukiDebug：阶段、传感器、投票、计距、轮速；不依赖 LED/myRIO 头文件。
+ * 1.0 实机反馈为下坡不停车、Y 纠偏不生效；本版修复可复现代码问题，仍需实机验收。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
  * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
@@ -27,6 +24,43 @@
 #define Y_ALIGNMENT_THRESHOLD_G         0.01
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
+
+/* 【实机输入配置】轴编号 0=X、1=Y、2=Z；配置映射后的 X 朝前、Y 横向、Z 朝上。
+ * 默认输入单位 g；若调用方传 m/s^2，把 ACCEL_UNITS_PER_G 设为 9.80665。
+ * 不自动猜单位/方向，不在坡上自动校准。平放静止时测安装偏角后再设置补偿。
+ * 先消除横滚，再消除俯仰；默认偏角 0。所有配置均可在工程 -D 宏中覆盖。
+ */
+#ifndef ACCEL_UNITS_PER_G
+#define ACCEL_UNITS_PER_G                1.0
+#endif
+#ifndef ACCEL_FORWARD_AXIS
+#define ACCEL_FORWARD_AXIS               0
+#endif
+#ifndef ACCEL_SIDE_AXIS
+#define ACCEL_SIDE_AXIS                  1
+#endif
+#ifndef ACCEL_VERTICAL_AXIS
+#define ACCEL_VERTICAL_AXIS              2
+#endif
+#ifndef ACCEL_FORWARD_SIGN
+#define ACCEL_FORWARD_SIGN               1
+#endif
+#ifndef ACCEL_SIDE_SIGN
+#define ACCEL_SIDE_SIGN                  1
+#endif
+#ifndef ACCEL_VERTICAL_SIGN
+#define ACCEL_VERTICAL_SIGN              1
+#endif
+#ifndef ACCEL_MOUNT_ROLL_DEG
+#define ACCEL_MOUNT_ROLL_DEG              0.0
+#endif
+#ifndef ACCEL_MOUNT_PITCH_DEG
+#define ACCEL_MOUNT_PITCH_DEG             0.0
+#endif
+/* 正常前进时净里程应递增；仅实测确认反向后才设为 -1。距离接口仍为 mm。 */
+#ifndef DISTANCE_FORWARD_SIGN
+#define DISTANCE_FORWARD_SIGN            1
+#endif
 
 /* 【路线轮速】先按阶段选择，再应用 Y 纠偏和固定轮速补偿。 */
 #define APPROACH_SPEED_MM_S              400
@@ -84,6 +118,15 @@
 #if FINISH_DISTANCE_MM <= 0
 #error Finish_distance_must_be_positive
 #endif
+#if ACCEL_FORWARD_AXIS < 0 || ACCEL_FORWARD_AXIS > 2 || ACCEL_SIDE_AXIS < 0 || ACCEL_SIDE_AXIS > 2 || ACCEL_VERTICAL_AXIS < 0 || ACCEL_VERTICAL_AXIS > 2
+#error Invalid_accelerometer_axis
+#endif
+#if ACCEL_FORWARD_AXIS == ACCEL_SIDE_AXIS || ACCEL_FORWARD_AXIS == ACCEL_VERTICAL_AXIS || ACCEL_SIDE_AXIS == ACCEL_VERTICAL_AXIS
+#error Accelerometer_axes_must_be_distinct
+#endif
+#if (ACCEL_FORWARD_SIGN != 1 && ACCEL_FORWARD_SIGN != -1) || (ACCEL_SIDE_SIGN != 1 && ACCEL_SIDE_SIGN != -1) || (ACCEL_VERTICAL_SIGN != 1 && ACCEL_VERTICAL_SIGN != -1) || (DISTANCE_FORWARD_SIGN != 1 && DISTANCE_FORWARD_SIGN != -1)
+#error Invalid_input_direction
+#endif
 
 typedef enum {
     APPROACH_RAMP = 0, CLIMB_RAMP, DRIVE_ACROSS_TOP,
@@ -130,6 +173,87 @@ typedef struct {
     int yIndex;
     int yCount;
 } navigation_t;
+
+/* 【只读调试快照】在 Eclipse Expressions 中展开 kobukiDebug。
+ * phase: 0接近、1上坡、2坡顶、3下坡、4终点直行、5停车。
+ * motion: 0直行、1碰撞倒车、2转向、3绕行、4回正、5悬崖倒车、6悬崖转向。
+ * invalidAccelSamples/stillDistanceSamples 是连续调用次数，不是毫秒或超时。
+ */
+typedef struct {
+    int phase, motion, button;
+    double rawX, rawY, rawZ;
+    double xG, yG, zG, magnitudeG, pitchDeg, tiltDeg;
+    bool accelValid;
+    int slopeSample, upVotes, downVotes, levelVotes, pitchCount;
+    int yPositiveVotes, yNegativeVotes, yCount, yCorrection;
+    int invalidAccelSamples, stillDistanceSamples;
+    int32_t distance, finishDistance;
+    int64_t forwardDelta;
+    bool countingFinish, finished;
+    int16_t maxWheelSpeed, leftWheelSpeed, rightWheelSpeed;
+} kobukiDebug_t;
+volatile kobukiDebug_t kobukiDebug;
+
+/* 验证、换算和安装补偿只做一次，坡度与 Y 判断共用同一组有效输入。 */
+static accelerometer_t prepareAcceleration(const accelerometer_t raw)
+{
+    accelerometer_t result;
+    double axes[3], x, y, z, rotatedY, rotatedZ;
+    double roll = ACCEL_MOUNT_ROLL_DEG / RAD_TO_DEG;
+    double pitch = ACCEL_MOUNT_PITCH_DEG / RAD_TO_DEG;
+    double magnitude;
+    memset(&result, 0, sizeof(result));
+    kobukiDebug.rawX = raw.x; kobukiDebug.rawY = raw.y; kobukiDebug.rawZ = raw.z;
+    kobukiDebug.accelValid = false;
+    kobukiDebug.xG = kobukiDebug.yG = kobukiDebug.zG = 0.0;
+    kobukiDebug.pitchDeg = kobukiDebug.tiltDeg = kobukiDebug.magnitudeG = 0.0;
+    if (!(ACCEL_UNITS_PER_G > 0.0)) { return result; }
+    axes[0] = raw.x / ACCEL_UNITS_PER_G;
+    axes[1] = raw.y / ACCEL_UNITS_PER_G;
+    axes[2] = raw.z / ACCEL_UNITS_PER_G;
+    x = axes[ACCEL_FORWARD_AXIS] * ACCEL_FORWARD_SIGN;
+    y = axes[ACCEL_SIDE_AXIS] * ACCEL_SIDE_SIGN;
+    z = axes[ACCEL_VERTICAL_AXIS] * ACCEL_VERTICAL_SIGN;
+    /* 比较形式同时拒绝 NaN/无穷，避免平方溢出；异常读数不参与 Y 投票。 */
+    if (!(fabs(x) <= 1.5 && fabs(y) <= 1.5 && fabs(z) <= 1.5)) { return result; }
+    magnitude = sqrt(x * x + y * y + z * z);
+    kobukiDebug.magnitudeG = magnitude;
+    if (!(magnitude >= 0.5 && magnitude <= 1.5)) { return result; }
+    rotatedY = y * cos(roll) - z * sin(roll);
+    rotatedZ = y * sin(roll) + z * cos(roll);
+    result.x = x * cos(pitch) - rotatedZ * sin(pitch);
+    result.y = rotatedY;
+    result.z = x * sin(pitch) + rotatedZ * cos(pitch);
+    if (!(fabs(result.x) <= 1.5 && fabs(result.y) <= 1.5 && fabs(result.z) <= 1.5)) {
+        memset(&result, 0, sizeof(result));
+        return result;
+    }
+    kobukiDebug.xG = result.x; kobukiDebug.yG = result.y; kobukiDebug.zG = result.z;
+    kobukiDebug.pitchDeg = atan2(result.x, sqrt(result.y * result.y + result.z * result.z)) * RAD_TO_DEG;
+    kobukiDebug.tiltDeg = atan2(sqrt(result.x * result.x + result.y * result.y), fabs(result.z)) * RAD_TO_DEG;
+    kobukiDebug.accelValid = true;
+    return result;
+}
+
+/* 成对缩放保留差速比例，例如上坡 400/300 在上限 200 时输出 200/150。 */
+static void limitWheelPair(int16_t * const left, int16_t * const right, const int16_t maximum)
+{
+    int peak = abs(*left) > abs(*right) ? abs(*left) : abs(*right);
+    if (maximum <= 0) { *left = *right = 0; return; }
+    if (peak > maximum) {
+        *left = (int16_t)((int32_t)*left * maximum / peak);
+        *right = (int16_t)((int32_t)*right * maximum / peak);
+    }
+}
+
+/* 净里程是 int32 累计 mm；支持正常的 32 位回绕，单次真实变化须小于半量程。 */
+static int64_t forwardDistanceDelta(const int32_t current, const int32_t previous)
+{
+    int64_t delta = (int64_t)current - previous;
+    if (delta > 2147483647LL) { delta -= 4294967296LL; }
+    else if (delta < -2147483648LL) { delta += 4294967296LL; }
+    return delta * DISTANCE_FORWARD_SIGN;
+}
 
 /* 【通用控制】所有轮速均受调用方 maxWheelSpeed 限制。 */
 static int16_t limitSpeed(const int16_t speed, const int16_t maximum)
@@ -377,13 +501,33 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     const int16_t right, const int16_t maximum, const int32_t distance,
     int16_t * const pRight, int16_t * const pLeft)
 {
-    *pLeft = trimWheelSpeed(left, WHEEL_SPEED_TRIM < 0 ? -WHEEL_SPEED_TRIM : 0, maximum);
-    *pRight = trimWheelSpeed(right, WHEEL_SPEED_TRIM > 0 ? WHEEL_SPEED_TRIM : 0, maximum);
+    int i;
+    *pLeft = trimWheelSpeed(left, WHEEL_SPEED_TRIM < 0 ? -WHEEL_SPEED_TRIM : 0, 32767);
+    *pRight = trimWheelSpeed(right, WHEEL_SPEED_TRIM > 0 ? WHEEL_SPEED_TRIM : 0, 32767);
+    limitWheelPair(pLeft, pRight, maximum);
     nav->lastDistance = distance;
     nav->countFinishDistance = nav->phase == FINISH_STRAIGHT
         && nav->button == RUNNING && nav->motion == ROUTE_DRIVE
         && *pLeft > 0 && *pRight > 0;
     if (nav->button != RUNNING) { nav->headingControlActive = false; }
+    kobukiDebug.phase = nav->phase; kobukiDebug.motion = nav->motion; kobukiDebug.button = nav->button;
+    kobukiDebug.pitchCount = nav->pitchCount; kobukiDebug.yCount = nav->yCount;
+    kobukiDebug.upVotes = kobukiDebug.downVotes = kobukiDebug.levelVotes = 0;
+    kobukiDebug.yPositiveVotes = kobukiDebug.yNegativeVotes = 0;
+    for (i = 0; i < nav->pitchCount; i++) {
+        if (nav->pitchSamples[i] == SAMPLE_UPHILL) { kobukiDebug.upVotes++; }
+        if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { kobukiDebug.downVotes++; }
+        if (nav->pitchSamples[i] == SAMPLE_LEVEL) { kobukiDebug.levelVotes++; }
+    }
+    for (i = 0; i < nav->yCount; i++) {
+        if (nav->ySamples[i] > 0) { kobukiDebug.yPositiveVotes++; }
+        if (nav->ySamples[i] < 0) { kobukiDebug.yNegativeVotes++; }
+    }
+    kobukiDebug.distance = distance; kobukiDebug.finishDistance = nav->finishDistance;
+    kobukiDebug.countingFinish = nav->countFinishDistance;
+    kobukiDebug.finished = nav->phase == FINISHED;
+    kobukiDebug.maxWheelSpeed = maximum;
+    kobukiDebug.leftWheelSpeed = *pLeft; kobukiDebug.rightWheelSpeed = *pRight;
 }
 
 void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
@@ -402,11 +546,21 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
     bool turnCompleted;
+    accelerometer_t calibratedAccel;
     (void)isSimulator;
+
+    calibratedAccel = prepareAcceleration(accelAxes);
+    kobukiDebug.slopeSample = classifySlope(calibratedAccel);
+    kobukiDebug.yCorrection = 0;
+    kobukiDebug.forwardDelta = 0;
+    if (kobukiDebug.accelValid) { kobukiDebug.invalidAccelSamples = 0; }
+    else if (kobukiDebug.invalidAccelSamples < 2147483647) { kobukiDebug.invalidAccelSamples++; }
 
     /* B1 重置后仍为停车等待状态，必须重新按下并松开 B0。 */
     if (!nav.initialized || sensors.buttons.B1) {
         resetRun(&nav, netDistance, netAngle);
+        kobukiDebug.stillDistanceSamples = 0;
+        kobukiDebug.invalidAccelSamples = kobukiDebug.accelValid ? 0 : 1;
         /* 重置时若 B0 已按住，先等它释放，避免把旧按键当成新启动。 */
         if (sensors.buttons.B0) { nav.button = WAIT_PAUSE_RELEASE; }
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
@@ -416,7 +570,12 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
 
     /* 用上一周期的命令决定计距：只加前进距离，不把倒车取绝对值。 */
     if (nav.countFinishDistance) {
-        delta = (int64_t)netDistance - nav.lastDistance;
+        delta = forwardDistanceDelta(netDistance, nav.lastDistance);
+        kobukiDebug.forwardDelta = delta;
+        if (delta == 0) {
+            if (kobukiDebug.stillDistanceSamples < 2147483647) { kobukiDebug.stillDistanceSamples++; }
+        }
+        else { kobukiDebug.stillDistanceSamples = 0; }
         if (delta > 0) {
             if (delta >= FINISH_DISTANCE_MM - nav.finishDistance) {
                 nav.finishDistance = FINISH_DISTANCE_MM;
@@ -424,6 +583,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             else { nav.finishDistance += (int32_t)delta; }
         }
     }
+    else { kobukiDebug.stillDistanceSamples = 0; }
     if (nav.phase == FINISH_STRAIGHT && nav.finishDistance >= FINISH_DISTANCE_MM) {
         nav.phase = FINISHED;
     }
@@ -466,10 +626,12 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (cliff && nav.motion != CLIFF_BACKUP && nav.motion != CLIFF_TURN) {
         beginCliff(&nav, sensors, netDistance);
     }
-    /* 前半段按参考文件先完成整轮碰撞避障，再推进坡道阶段。 */
-    if (!cliff && nav.motion == ROUTE_DRIVE
+    /* 绕障直行也可能驶上坡；确认后立即结束地面避障，交给坡道控制。
+     * 倒车、转向及悬崖动作不采样，防止把运动加速度误当作上/下坡。
+     */
+    if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT) {
-        updateRoute(&nav, accelAxes, netAngle);
+        updateRoute(&nav, calibratedAccel, netAngle);
     }
     if (nav.motion == CLIFF_BACKUP
         && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
@@ -507,7 +669,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.motion == OBSTACLE_CLEAR
             && (nav.phase == APPROACH_RAMP
                 ? backupDistanceReached(netDistance, nav.maneuverDistance, OBSTACLE_CLEAR_DISTANCE_MM)
-                : (int64_t)netDistance - nav.maneuverDistance >= OBSTACLE_CLEAR_DISTANCE_MM)) {
+                : forwardDistanceDelta(netDistance, nav.maneuverDistance) >= OBSTACLE_CLEAR_DISTANCE_MM)) {
             nav.motion = OBSTACLE_REORIENT;
         }
         else if (nav.motion == OBSTACLE_REORIENT
@@ -527,19 +689,17 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.phase == FINISH_STRAIGHT) { speed = FINISH_SPEED_MM_S; }
         left = right = limitSpeed(speed, maxWheelSpeed);
         if (nav.phase == CLIMB_RAMP || nav.phase == DESCEND_RAMP) {
-            correction = updateY(&nav, accelAxes.y);
+            correction = updateY(&nav, kobukiDebug.accelValid ? calibratedAccel.y : 0.0);
+            if (!kobukiDebug.accelValid) { correction = 0; }
+            kobukiDebug.yCorrection = correction;
             if (correction != 0) {
                 if (nav.phase == CLIMB_RAMP) {
-                    left = limitSpeed(correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S
-                        : UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-                    right = limitSpeed(correction > 0 ? UPHILL_ALIGN_INNER_SPEED_MM_S
-                        : UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+                    left = correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S : UPHILL_ALIGN_INNER_SPEED_MM_S;
+                    right = correction > 0 ? UPHILL_ALIGN_INNER_SPEED_MM_S : UPHILL_ALIGN_OUTER_SPEED_MM_S;
                 }
                 else {
-                    left = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_INNER_SPEED_MM_S
-                        : DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-                    right = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_OUTER_SPEED_MM_S
-                        : DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+                    left = correction > 0 ? DOWNHILL_ALIGN_INNER_SPEED_MM_S : DOWNHILL_ALIGN_OUTER_SPEED_MM_S;
+                    right = correction > 0 ? DOWNHILL_ALIGN_OUTER_SPEED_MM_S : DOWNHILL_ALIGN_INNER_SPEED_MM_S;
                 }
             }
         }
@@ -556,13 +716,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         left = right = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
         break;
     case OBSTACLE_REORIENT:
-        if (nav.phase == APPROACH_RAMP) {
-            /* 参考文件：按避障转向的反方向、固定轮速回到原路线航向。 */
-            speed = limitSpeed(OBSTACLE_TURN_SPEED_MM_S, maxWheelSpeed);
-            left = nav.turnRight ? -speed : speed;
-            right = -left;
-            break;
-        }
+        /* 两个地面阶段统一按剩余误差回正；越过目标后反向，避免原地转整圈。 */
         error = signedAngleError(netAngle, nav.routeHeading);
         if (abs(error) <= HEADING_TOLERANCE_DEG) { break; }
         reorientSpeed = abs(error) * REORIENT_GAIN_MM_S_PER_DEG;

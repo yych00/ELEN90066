@@ -19,6 +19,8 @@ $scenarios = @(
     'angle_wrap', 'ramp_during_clear', 'finished_latch', 'reset_held_button', 'speed_cap',
     'approach_heading_target', 'clear_heading_hold', 'clear_distance_direction',
     'repeated_collision_heading',
+    'configured_course', 'y_limited_pair', 'invalid_y_input', 'finish_distance_wrap',
+    'finish_distance_frozen', 'ramp_clear_vote_threshold', 'no_slope_during_turn',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
 )
@@ -35,7 +37,25 @@ try {
             if ($LASTEXITCODE -ne 0) { throw "Failed: $scenario ($mode)" }
         }
     }
-    Write-Output "PASS: $($scenarios.Count) scenarios x 2 interface modes; GNU89/C99 checks passed."
+    # 对不同实机接线/单位/安装角配置，分别走完上坡、坡顶、下坡和终点停车。
+    $variants = @(
+        @{ Name='si_units'; Flags=@('-DACCEL_UNITS_PER_G=9.80665'); Scenario='configured_course' },
+        @{ Name='axis_mapping'; Flags=@('-DACCEL_FORWARD_AXIS=1','-DACCEL_SIDE_AXIS=0','-DACCEL_FORWARD_SIGN=-1','-DACCEL_SIDE_SIGN=-1','-DACCEL_VERTICAL_SIGN=-1'); Scenario='configured_course' },
+        @{ Name='mounting_offsets'; Flags=@('-DACCEL_MOUNT_ROLL_DEG=3.0','-DACCEL_MOUNT_PITCH_DEG=4.0'); Scenario='configured_course' },
+        @{ Name='reverse_odometry'; Flags=@('-DDISTANCE_FORWARD_SIGN=-1'); Scenario='configured_course' },
+        @{ Name='invalid_units'; Flags=@('-DACCEL_UNITS_PER_G=0.0'); Scenario='bad_accel_configuration' }
+    )
+    foreach ($variant in $variants) {
+        $flags = $variant.Flags
+        & $Compiler -std=gnu89 -Wall -Wextra -Werror -O2 @includes @flags $testSource -o $testExecutable -lm
+        if ($LASTEXITCODE -ne 0) { throw "Variant compilation failed: $($variant.Name)" }
+        foreach ($mode in @('hardware', 'simulator')) {
+            & $testExecutable $variant.Scenario $mode
+            if ($LASTEXITCODE -ne 0) { throw "Variant failed: $($variant.Name) ($mode)" }
+        }
+        Write-Output "PASS configuration: $($variant.Name)"
+    }
+    Write-Output "PASS: $($scenarios.Count) scenarios x 2 interface modes + $($variants.Count) configurations x 2 modes; GNU89/C99 checks passed."
 }
 finally {
     if (Test-Path -LiteralPath $testExecutable) { Remove-Item -LiteralPath $testExecutable }
