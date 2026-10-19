@@ -3,6 +3,8 @@
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
  * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地直接停车锁止。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
+ * 下坡标志锁存后独立检测落地：前后俯仰在 ±4.8° 内，最近 8 次中 6 次确认。
+ * 落地窗口在暂停和悬崖动作期间冻结，只有 B1 重置或首次确认下坡时清空。
  * 坡度采用 8 中 6 投票，保留 Y 纠偏与轮速；combined.c 保持原文件。
  * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
@@ -24,6 +26,7 @@
 #define RAD_TO_DEG                       57.29577951308232
 #define PITCH_THRESHOLD_DEG              5.0
 #define LEVEL_TILT_DEG                   4.5  /* 整体倾角：同时约束前后和横向 */
+#define LANDING_PITCH_DEG                4.8  /* 下坡后的落地俯仰容差，小于 5° 坡度阈值。 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      6
 #define Y_ALIGNMENT_THRESHOLD_G          0.01
@@ -130,6 +133,9 @@ typedef struct {
     bool countFinishDistance;
     bool downhillFlag; /* 只在路线进入 DESCEND_RAMP 时置位，坡顶平地不能置位。 */
     bool landingFlag;  /* 只在已进入下坡之后再次确认平地时置位，B1 清除。 */
+    bool landingSamples[PITCH_WINDOW_SAMPLE_COUNT];
+    int landingIndex;
+    int landingCount;
     bool confirmingUphill; /* 坡道入口碰撞时停车确认；不改变路线或停车标志。 */
     slopeSample_t pitchSamples[PITCH_WINDOW_SAMPLE_COUNT];
     int pitchIndex;
@@ -140,7 +146,6 @@ typedef struct {
     int32_t yCorrectionDurationMs;
     int32_t yCooldownMs;
     int32_t lastTimeStamp; /* 用有符号 32 位保存完整的 16 位时间戳。 */
-    int levelGroundCount;  /* 拿到下坡flag后，平地持续检测计数器 */
 } navigation_t;
 
 /* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
@@ -187,7 +192,6 @@ static void resetVotes(navigation_t * const nav)
     nav->yIndex = nav->yCount = 0;
     nav->yCorrectionDurationMs = 0;
     nav->yCooldownMs = 0;
-    nav->levelGroundCount = 0;
 }
 
 static void resetRun(navigation_t * const nav, const int32_t distance,
@@ -220,8 +224,8 @@ static void resetCliffVotes(navigation_t * const nav)
     }
 }
 
-/* 【坡度判断】通常按整体倾角判平地；已确认下坡后按前后俯仰持续判落地。
- * 放宽落地判断时的合加速度范围与俯仰阈值，彻底消除死区并吸收接缝冲击。
+/* 【坡度判断】通常按整体倾角判平地；已确认下坡后仅按前后俯仰判落地。
+ * 过小/过大的合加速度不投有效票。落地判断不受 Y 轴倾角直接限制。
  */
 static slopeSample_t classifySlope(const accelerometer_t accel, const bool landingCheck)
 {
@@ -229,20 +233,14 @@ static slopeSample_t classifySlope(const accelerometer_t accel, const bool landi
     double magnitude = sqrt(accel.x * accel.x + lateral * lateral);
     double pitch;
     double tilt;
-    double magMin = landingCheck ? 0.3 : 0.5;
-    double magMax = landingCheck ? 2.2 : 1.5;
-    if (!(magnitude >= magMin && magnitude <= magMax)) { return SAMPLE_UNKNOWN; }
+    if (!(magnitude >= 0.5 && magnitude <= 1.5)) { return SAMPLE_UNKNOWN; }
     pitch = atan2(accel.x, lateral) * RAD_TO_DEG;
     tilt = atan2(sqrt(accel.x * accel.x + accel.y * accel.y),
         fabs(accel.z)) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
-    if (landingCheck) {
-        if (pitch > -PITCH_THRESHOLD_DEG && pitch < PITCH_THRESHOLD_DEG) {
-            return SAMPLE_LEVEL;
-        }
-    } else {
-        if (tilt <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
+    if (landingCheck ? fabs(pitch) <= LANDING_PITCH_DEG : tilt <= LEVEL_TILT_DEG) {
+        return SAMPLE_LEVEL;
     }
     return SAMPLE_UNKNOWN;
 }
@@ -254,75 +252,66 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     int i;
     int up = 0, down = 0, level = 0;
     routePhase_t next = nav->phase;
-    slopeSample_t currentSample = classifySlope(accel, nav->downhillFlag);
-
-    nav->pitchSamples[nav->pitchIndex] = currentSample;
+    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel, false);
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
     if (nav->pitchCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->pitchCount++; }
-
-    for (i = 0; i < nav->pitchCount; i++) {
+    if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
+    for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
         if (nav->pitchSamples[i] == SAMPLE_UPHILL) { up++; }
         else if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { down++; }
         else if (nav->pitchSamples[i] == SAMPLE_LEVEL) { level++; }
     }
-
-    /* 【获得下坡 flag】爬坡中或坡顶，检测到下坡趋势（4票下坡），立即锁存下坡标志 */
-    if (!nav->downhillFlag && (nav->phase == CLIMB_RAMP || nav->phase == DRIVE_ACROSS_TOP)) {
-        if (down >= 4) {
-            nav->downhillFlag = true;
-            next = DESCEND_RAMP;
-        }
-    }
-
-    /* 【拿到下坡 flag 后的平地持续检测】
-     * 只要已获得下坡 flag，在平地上全程持续检测；
-     * 当车身脱离下坡（最新样本为平地）时持续累加；当下坡时清零。
-     * 连续 6 拍或窗口满 6 票平地，直接判定到达平地停车锁止。
-     */
-    if (nav->downhillFlag) {
-        if (currentSample == SAMPLE_LEVEL) {
-            nav->levelGroundCount++;
-        }
-        else if (currentSample == SAMPLE_DOWNHILL) {
-            nav->levelGroundCount = 0;
-        }
-        if (nav->levelGroundCount >= 6 || level >= 6) {
-            next = FINISHED;
-        }
-    }
-
     switch (nav->phase) {
     case APPROACH_RAMP:
         if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
         break;
     case CLIMB_RAMP:
-        if (down >= 4) { next = DESCEND_RAMP; }
+        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
         else if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
         break;
     case DRIVE_ACROSS_TOP:
-        if (down >= 4) { next = DESCEND_RAMP; }
+        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (nav->downhillFlag && (nav->levelGroundCount >= 6 || level >= 6)) {
-            next = FINISHED;
-        }
+        /* 落地停车由 downhillFlag 门控的独立窗口处理。 */
         break;
     default:
         break;
     }
-
     if (next != nav->phase) {
         nav->phase = next;
-        if (next == DESCEND_RAMP) { nav->downhillFlag = true; }
+        if (next == DESCEND_RAMP && !nav->downhillFlag) {
+            nav->downhillFlag = true;
+            nav->landingIndex = nav->landingCount = 0;
+        }
         resetVotes(nav);
         /* 上坡期间关闭原地面避障动作；悬崖动作在本函数调用前已排除。 */
         if (!onGround(next)) { nav->motion = ROUTE_DRIVE; }
-        if (next == FINISH_STRAIGHT || next == FINISHED) {
-            nav->landingFlag = true;
-            nav->finishDistance = 0;
-            nav->countFinishDistance = false;
-            nav->routeHeading = angle;
-        }
+    }
+    (void)angle;
+}
+
+/* 【独立落地停车】只依赖已锁存的下坡标志，不再要求路线仍为 DESCEND_RAMP。
+ * 调用方只在正常行驶、没有悬崖报警时采样。无效读数占窗口但不算平地票。
+ * 本窗口不随 resetVotes/resetCliffVotes 清空，暂停和避让后接着检测。
+ */
+static void updateLanding(navigation_t * const nav, const accelerometer_t accel)
+{
+    int i;
+    int level = 0;
+    if (!nav->downhillFlag || nav->landingFlag) { return; }
+    nav->landingSamples[nav->landingIndex] = classifySlope(accel, true) == SAMPLE_LEVEL;
+    nav->landingIndex = (nav->landingIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
+    if (nav->landingCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->landingCount++; }
+    if (nav->landingCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
+    for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
+        if (nav->landingSamples[i]) { level++; }
+    }
+    if (level >= PITCH_REQUIRED_SAMPLE_COUNT) {
+        nav->landingFlag = true;
+        nav->phase = FINISHED;
+        nav->motion = ROUTE_DRIVE;
+        nav->countFinishDistance = false;
     }
 }
 
@@ -511,7 +500,8 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         nav.phase = FINISHED;
     }
     /* 【终点锁止】优先于 B0、bumper 和悬崖；任何输入都不能自动复跑。 */
-    if (nav.phase == FINISHED) {
+    if (nav.landingFlag || nav.phase == FINISHED) {
+        nav.phase = FINISHED;
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
             pRightWheelSpeed, pLeftWheelSpeed);
         return;
@@ -553,6 +543,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT && nav.phase != FINISHED) {
         updateRoute(&nav, accelAxes, netAngle);
+    }
+    /* 下坡标志一旦置位就持续检测落地；暂停、倒车和转向都不更新窗口。 */
+    if (!cliff && nav.motion == ROUTE_DRIVE && !nav.confirmingUphill) {
+        updateLanding(&nav, accelAxes);
         if (nav.phase == FINISHED) {
             outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
                 pRightWheelSpeed, pLeftWheelSpeed);
