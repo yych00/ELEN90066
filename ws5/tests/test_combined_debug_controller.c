@@ -76,6 +76,26 @@ static int repairScenario(const char * const name)
         terrain(-15, -0.02); samples(5, 0, 0); expect(100, 75);
         assert(kobukiDebug.yCorrection == -1 && kobukiDebug.maxWheelSpeed == 100);
     }
+    else if (strcmp(name, "y_sensitive_switching") == 0) {
+        start(0); climb(); samples(5, 0, 0);
+        /* 小于旧门槛的偏差：两票不触发，第三票开始纠偏。 */
+        terrain(15, 0.008); samples(2, 0, 0); expect(400, 400);
+        tick(0, 0); expect(400, 300);
+        /* 中性样本让同方向票数降到三票以下，退出到两轮同速。 */
+        terrain(15, 0); samples(2, 0, 0); expect(400, 300);
+        tick(0, 0); expect(400, 400);
+        /* 反向同样在三票时触发，正反切换共用五次窗口。 */
+        terrain(15, -0.008); samples(2, 0, 0); expect(400, 400);
+        tick(0, 0); expect(300, 400);
+        samples(5, 0, 0);
+        terrain(15, 0.008); samples(2, 0, 0); expect(300, 400);
+        tick(0, 0); expect(400, 300);
+        /* 新门槛以下的偏差不触发；下坡按相反轮速方向纠偏。 */
+        terrain(15, 0.005); samples(5, 0, 0); expect(400, 400);
+        terrain(-15, 0); samples(8, 0, 0); samples(5, 0, 0);
+        terrain(-15, 0.008); samples(3, 0, 0); expect(150, 200);
+        terrain(-15, 0); samples(3, 0, 0); expect(200, 200);
+    }
     else if (strcmp(name, "invalid_y_input") == 0) {
         start(0); climb();
         terrain(15, 0.02); samples(5, 0, 0); expect(400, 300);

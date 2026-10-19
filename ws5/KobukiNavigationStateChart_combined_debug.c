@@ -21,7 +21,7 @@
 #define LEVEL_TILT_DEG                   3.0  /* 整体倾角：同时约束前后和横向 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      7
-#define Y_ALIGNMENT_THRESHOLD_G         0.01
+#define Y_ALIGNMENT_THRESHOLD_G         0.006 /* 更灵敏：进入/退出共用五次窗口、三票门槛 */
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
 
@@ -377,7 +377,10 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     }
 }
 
-/* 【Y 差速纠偏】五次中三次同方向；只覆盖正常上、下坡的直行轮速。 */
+/* 【Y 差速纠偏】五次中三次同方向超过 ±0.006 g 时进入；
+ * 两个方向都不足三票时退出，反方向达到三票时直接切换。
+ * 进入、退出共用同一个窗口；只覆盖正常上、下坡的直行轮速。
+ */
 static int updateY(navigation_t * const nav, const double y)
 {
     int i;

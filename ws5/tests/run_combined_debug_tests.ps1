@@ -19,7 +19,7 @@ $scenarios = @(
     'angle_wrap', 'ramp_during_clear', 'finished_latch', 'reset_held_button', 'speed_cap',
     'approach_heading_target', 'clear_heading_hold', 'clear_distance_direction',
     'repeated_collision_heading',
-    'configured_course', 'y_limited_pair', 'invalid_y_input', 'finish_distance_wrap',
+    'configured_course', 'y_limited_pair', 'y_sensitive_switching', 'invalid_y_input', 'finish_distance_wrap',
     'finish_distance_frozen', 'ramp_clear_vote_threshold', 'no_slope_during_turn',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
