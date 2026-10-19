@@ -1,7 +1,8 @@
 /*
  * WS5 + 地面避障完整控制器：版本 1.1。
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
- * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地直接停车锁止。
+ * 独立持续检测下坡：8 中 6 置 downhillFlag -> 切入下坡 -> 确认平地停车锁止。
+ * 下坡投票不随路线切换清空；暂停和避让时冻结，flag 只在 B1 重置时清除。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
  * 下坡标志锁存后独立检测落地：前后俯仰在 ±4.8° 内，最近 8 次中 6 次确认。
  * 落地窗口在暂停和悬崖动作期间冻结，只有 B1 重置或首次确认下坡时清空。
@@ -129,7 +130,10 @@ typedef struct {
     int32_t lastDistance;
     int32_t finishDistance;
     bool countFinishDistance;
-    bool downhillFlag; /* 只在路线进入 DESCEND_RAMP 时置位，坡顶平地不能置位。 */
+    bool downhillFlag; /* 独立下坡窗口确认后锁存，不依赖路线切换，B1 清除。 */
+    bool downhillSamples[PITCH_WINDOW_SAMPLE_COUNT];
+    int downhillIndex;
+    int downhillCount;
     bool landingFlag;  /* 只在已进入下坡之后再次确认平地时置位，B1 清除。 */
     bool landingSamples[PITCH_WINDOW_SAMPLE_COUNT];
     int landingIndex;
@@ -180,7 +184,7 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 路线切换清空坡度窗口，保留正常行驶中的 Y 投票；落地窗口独立保存。 */
+/* 路线切换只清空路线坡度窗口；独立下坡/落地窗口和已锁存 flag 不受影响。 */
 static void resetVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
@@ -228,46 +232,64 @@ static slopeSample_t classifySlope(const accelerometer_t accel, const bool landi
     return SAMPLE_UNKNOWN;
 }
 
+/* 【持续下坡检测】每次正常行驶都更新独立窗口，不要求先进入任何路线阶段。
+ * 非下坡和无效读数都占窗口且不算下坡票；暂停/倒车/转向时由调用方冻结。
+ * 满 8 次且至少 6 票下坡后先锁存 flag，再由 updateRoute 切换下坡模式。
+ */
+static void updateDownhillFlag(navigation_t * const nav, const accelerometer_t accel)
+{
+    int i;
+    int down = 0;
+    if (nav->downhillFlag || nav->landingFlag) { return; }
+    nav->downhillSamples[nav->downhillIndex] = classifySlope(accel, false) == SAMPLE_DOWNHILL;
+    nav->downhillIndex = (nav->downhillIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
+    if (nav->downhillCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->downhillCount++; }
+    if (nav->downhillCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
+    for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
+        if (nav->downhillSamples[i]) { down++; }
+    }
+    if (down >= PITCH_REQUIRED_SAMPLE_COUNT) {
+        nav->downhillFlag = true;
+        nav->landingIndex = nav->landingCount = 0;
+        nav->confirmingUphill = false;
+    }
+}
+
 /* 【路线阶段】正常/绕障直行及入口停车确认时采样，倒车/转向不推进阶段。 */
 static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     const int32_t angle)
 {
     int i;
-    int up = 0, down = 0, level = 0;
+    int up = 0, level = 0;
     routePhase_t next = nav->phase;
+    /* flag 独立取得后驱动路线，不能反过来等路线先切入下坡才设置 flag。 */
+    if (nav->downhillFlag && !nav->landingFlag && nav->phase != DESCEND_RAMP) {
+        nav->phase = DESCEND_RAMP;
+        nav->motion = ROUTE_DRIVE;
+        resetVotes(nav);
+        return;
+    }
     nav->pitchSamples[nav->pitchIndex] = classifySlope(accel, false);
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
     if (nav->pitchCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->pitchCount++; }
     if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
     for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
         if (nav->pitchSamples[i] == SAMPLE_UPHILL) { up++; }
-        else if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { down++; }
         else if (nav->pitchSamples[i] == SAMPLE_LEVEL) { level++; }
     }
-    /* 参考文件优先识别下坡，不要求此前一定成功经过上坡/坡顶阶段。 */
-    if (down >= PITCH_REQUIRED_SAMPLE_COUNT && nav->phase != DESCEND_RAMP
-        && nav->phase != FINISH_STRAIGHT && nav->phase != FINISHED) {
-        next = DESCEND_RAMP;
-    }
-    else {
-        switch (nav->phase) {
-        case APPROACH_RAMP:
-            if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
-            break;
-        case CLIMB_RAMP:
-            if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
-            break;
-        default:
-            /* 坡顶等候下坡；下坡后的停车由独立落地窗口处理。 */
-            break;
-        }
+    switch (nav->phase) {
+    case APPROACH_RAMP:
+        if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
+        break;
+    case CLIMB_RAMP:
+        if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
+        break;
+    default:
+        /* 下坡由独立 flag 驱动，停车由独立落地窗口处理。 */
+        break;
     }
     if (next != nav->phase) {
         nav->phase = next;
-        if (next == DESCEND_RAMP && !nav->downhillFlag) {
-            nav->downhillFlag = true;
-            nav->landingIndex = nav->landingCount = 0;
-        }
         resetVotes(nav);
         /* 上坡期间关闭原地面避障动作；悬崖动作在本函数调用前已排除。 */
         if (!onGround(next)) { nav->motion = ROUTE_DRIVE; }
@@ -524,6 +546,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
      * 在路线切换前采样，进入上/下坡时可立即使用已有窗口。
      */
     if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)) {
+        updateDownhillFlag(&nav, accelAxes);
         correction = updateY(&nav, accelAxes.y);
     }
     /* 绕障直行也可能驶上坡道；坡度确认优先于本周期的碰撞倒车。 */
