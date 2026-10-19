@@ -1,5 +1,14 @@
 /*
- * WS5 + 地面避障完整控制器（加速度单位 g，距离 mm，轮速 mm/s）。
+ * WS5 + 地面避障完整控制器：版本 1.0。
+ * 版本来源：GitHub ws5/KobukiNavigationStateChart_combined_debug.c。
+ * 本版本同步覆盖到 KobukiNavigationStateChart_combined.c，两个文件内容一致。
+ * 【1.0 已知问题（实机反馈，待排查修复）】
+ * 1. 下坡到达平地后没有停车。
+ * 2. 上坡、下坡时未观察到 Y 轴检测/纠偏生效。
+ * 注意：源码已有平地定距停车及 Y 轴检测分支，上述现象的原因尚未确认。
+ * 本次仅标注版本、记录问题并同步文件，不表示上述问题已修复。
+ * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
+ * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
  * 本文件替换工程中的原状态机源文件，不与其他同名接口实现一起编译。
@@ -42,6 +51,19 @@
 #define HEADING_TOLERANCE_DEG            5
 #define REORIENT_MIN_SPEED_MM_S          40
 #define REORIENT_GAIN_MM_S_PER_DEG       6
+
+/* 【前半段航向保持】移植参考文件的阻尼、积分和每周期修正限幅参数。 */
+#ifndef HEADING_ANGLE_SIGN
+#define HEADING_ANGLE_SIGN               1
+#endif
+#define HEADING_KP_MM_S_PER_DEG           2.5
+#define HEADING_KD_MM_S_PER_DEG_STEP      8.0
+#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.015
+#define HEADING_MAX_INTEGRAL_MM_S        12.0
+#define HEADING_YAW_RATE_FILTER_ALPHA    0.25
+#define HEADING_CORRECTION_STEP_MM_S     3.0
+#define HEADING_DEADBAND_DEG             1
+#define HEADING_MAX_CORRECTION_MM_S      40
 
 /* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
@@ -88,6 +110,14 @@ typedef struct {
     bool turnRight;
     bool centreTurnRight;
     int32_t routeHeading;
+    int32_t clearHeading;
+    bool headingControlActive;
+    motionState_t headingControlMotion;
+    int32_t previousControlHeading;
+    int32_t previousControlAngle;
+    double filteredYawStep;
+    double previousCorrection;
+    double headingIntegral;
     int32_t maneuverDistance;
     int32_t maneuverAngle;
     int32_t lastDistance;
@@ -242,13 +272,17 @@ static int updateY(navigation_t * const nav, const double y)
     return 0;
 }
 
-/* 【地面避障】重复碰撞保留本轮原路线航向；新一轮从当前有效航向开始。 */
+/* 【地面避障】前半段保留启动/恢复时的路线航向，按参考文件回到原路线。
+ * 最后平面沿用本轮碰撞前的航向，避免影响已确认的终点直行方向。
+ */
 static void beginObstacle(navigation_t * const nav, const KobukiSensors_t sensors,
     const int32_t distance, const int32_t angle)
 {
     bool left = sensors.bumps_wheelDrops.bumpLeft;
     bool right = sensors.bumps_wheelDrops.bumpRight;
-    if (nav->motion == ROUTE_DRIVE) { nav->routeHeading = angle; }
+    if (nav->phase == FINISH_STRAIGHT && nav->motion == ROUTE_DRIVE) {
+        nav->routeHeading = angle;
+    }
     if (left && !right) { nav->turnRight = true; }
     else if (right && !left) { nav->turnRight = false; }
     else {
@@ -270,6 +304,74 @@ static void beginCliff(navigation_t * const nav, const KobukiSensors_t sensors,
     resetVotes(nav);
 }
 
+/* 【前半段直行/绕行纠偏】正常直行锁定路线航向，绕行锁定转向完成时的航向。
+ * 保留配置的基础速度；达到调用方轮速上限时，两轮同时减去超出量，保持差速。
+ * 和参考文件一样，KD 与积分按调用次数计算，调用周期变化会影响实际纠偏效果。
+ */
+static void maintainApproachHeading(navigation_t * const nav, const int32_t angle,
+    const int16_t maximum, int16_t * const left, int16_t * const right)
+{
+    int32_t target;
+    double error, yawStep = 0.0, correction, correctionLimit, baseSpeed;
+    double requestedLeft, requestedRight, excess;
+    if (nav->phase != APPROACH_RAMP || (nav->motion != ROUTE_DRIVE
+            && nav->motion != OBSTACLE_CLEAR)) {
+        nav->headingControlActive = false;
+        return;
+    }
+    target = nav->motion == OBSTACLE_CLEAR ? nav->clearHeading : nav->routeHeading;
+    error = HEADING_ANGLE_SIGN * signedAngleError(angle, target);
+    baseSpeed = *left;
+    correctionLimit = HEADING_MAX_CORRECTION_MM_S;
+    if (!nav->headingControlActive || nav->headingControlMotion != nav->motion
+        || nav->previousControlHeading != target) {
+        nav->filteredYawStep = nav->previousCorrection = nav->headingIntegral = 0.0;
+    }
+    else {
+        yawStep = HEADING_ANGLE_SIGN * signedAngleError(angle, nav->previousControlAngle);
+        nav->filteredYawStep = HEADING_YAW_RATE_FILTER_ALPHA * yawStep
+            + (1.0 - HEADING_YAW_RATE_FILTER_ALPHA) * nav->filteredYawStep;
+    }
+    nav->headingControlActive = true;
+    nav->headingControlMotion = nav->motion;
+    nav->previousControlHeading = target;
+    nav->previousControlAngle = angle;
+    if (fabs(error) <= 15.0 && baseSpeed > 0.0) {
+        nav->headingIntegral += HEADING_KI_MM_S_PER_DEG_SAMPLE * error;
+        if (nav->headingIntegral > HEADING_MAX_INTEGRAL_MM_S) {
+            nav->headingIntegral = HEADING_MAX_INTEGRAL_MM_S;
+        }
+        if (nav->headingIntegral < -HEADING_MAX_INTEGRAL_MM_S) {
+            nav->headingIntegral = -HEADING_MAX_INTEGRAL_MM_S;
+        }
+    }
+    if (error > HEADING_DEADBAND_DEG) { error -= HEADING_DEADBAND_DEG; }
+    else if (error < -HEADING_DEADBAND_DEG) { error += HEADING_DEADBAND_DEG; }
+    else { error = 0.0; }
+    correction = HEADING_KP_MM_S_PER_DEG * error
+        + HEADING_KD_MM_S_PER_DEG_STEP * nav->filteredYawStep + nav->headingIntegral;
+    if (correctionLimit > baseSpeed / 2.0) { correctionLimit = baseSpeed / 2.0; }
+    if (correction > correctionLimit) { correction = correctionLimit; }
+    if (correction < -correctionLimit) { correction = -correctionLimit; }
+    if (correction > nav->previousCorrection + HEADING_CORRECTION_STEP_MM_S) {
+        correction = nav->previousCorrection + HEADING_CORRECTION_STEP_MM_S;
+    }
+    if (correction < nav->previousCorrection - HEADING_CORRECTION_STEP_MM_S) {
+        correction = nav->previousCorrection - HEADING_CORRECTION_STEP_MM_S;
+    }
+    if (correction > correctionLimit) { correction = correctionLimit; }
+    if (correction < -correctionLimit) { correction = -correctionLimit; }
+    nav->previousCorrection = correction;
+    requestedLeft = baseSpeed + correction;
+    requestedRight = baseSpeed - correction;
+    excess = (requestedLeft > requestedRight ? requestedLeft : requestedRight) - maximum;
+    if (excess > 0.0) { requestedLeft -= excess; requestedRight -= excess; }
+    if (requestedLeft < 0.0) { requestedLeft = 0.0; }
+    if (requestedRight < 0.0) { requestedRight = 0.0; }
+    *left = (int16_t)floor(requestedLeft + 0.5);
+    *right = (int16_t)floor(requestedRight + 0.5);
+}
+
 /* 【统一输出与终点计距】只把正常直行命令覆盖的区间标为可累计。 */
 static void outputSpeeds(navigation_t * const nav, const int16_t left,
     const int16_t right, const int16_t maximum, const int32_t distance,
@@ -281,6 +383,7 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     nav->countFinishDistance = nav->phase == FINISH_STRAIGHT
         && nav->button == RUNNING && nav->motion == ROUTE_DRIVE
         && *pLeft > 0 && *pRight > 0;
+    if (nav->button != RUNNING) { nav->headingControlActive = false; }
 }
 
 void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
@@ -347,6 +450,9 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             nav.button = RUNNING;
             resetVotes(&nav);
             if (!nav.hasStarted) { nav.routeHeading = netAngle; nav.hasStarted = true; }
+            if (nav.phase == APPROACH_RAMP && nav.motion == ROUTE_DRIVE) {
+                nav.routeHeading = netAngle;
+            }
         }
         break;
     }
@@ -360,7 +466,8 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (cliff && nav.motion != CLIFF_BACKUP && nav.motion != CLIFF_TURN) {
         beginCliff(&nav, sensors, netDistance);
     }
-    if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
+    /* 前半段按参考文件先完成整轮碰撞避障，再推进坡道阶段。 */
+    if (!cliff && nav.motion == ROUTE_DRIVE
         && nav.phase != FINISH_STRAIGHT) {
         updateRoute(&nav, accelAxes, netAngle);
     }
@@ -384,7 +491,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         turnCompleted = nav.motion == OBSTACLE_TURN
             && abs(signedAngleError(netAngle, nav.maneuverAngle)) >= OBSTACLE_TURN_ANGLE_DEG;
         if (bumper && ((nav.motion != OBSTACLE_BACKUP && nav.motion != OBSTACLE_TURN)
-                || turnCompleted)) {
+                || (turnCompleted && nav.phase != APPROACH_RAMP))) {
             beginObstacle(&nav, sensors, netDistance, netAngle);
         }
         else if (nav.motion == OBSTACLE_BACKUP
@@ -394,10 +501,13 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         }
         else if (turnCompleted) {
             nav.maneuverDistance = netDistance;
+            nav.clearHeading = netAngle;
             nav.motion = OBSTACLE_CLEAR;
         }
         else if (nav.motion == OBSTACLE_CLEAR
-            && (int64_t)netDistance - nav.maneuverDistance >= OBSTACLE_CLEAR_DISTANCE_MM) {
+            && (nav.phase == APPROACH_RAMP
+                ? backupDistanceReached(netDistance, nav.maneuverDistance, OBSTACLE_CLEAR_DISTANCE_MM)
+                : (int64_t)netDistance - nav.maneuverDistance >= OBSTACLE_CLEAR_DISTANCE_MM)) {
             nav.motion = OBSTACLE_REORIENT;
         }
         else if (nav.motion == OBSTACLE_REORIENT
@@ -446,6 +556,13 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         left = right = limitSpeed(APPROACH_SPEED_MM_S, maxWheelSpeed);
         break;
     case OBSTACLE_REORIENT:
+        if (nav.phase == APPROACH_RAMP) {
+            /* 参考文件：按避障转向的反方向、固定轮速回到原路线航向。 */
+            speed = limitSpeed(OBSTACLE_TURN_SPEED_MM_S, maxWheelSpeed);
+            left = nav.turnRight ? -speed : speed;
+            right = -left;
+            break;
+        }
         error = signedAngleError(netAngle, nav.routeHeading);
         if (abs(error) <= HEADING_TOLERANCE_DEG) { break; }
         reorientSpeed = abs(error) * REORIENT_GAIN_MM_S_PER_DEG;
@@ -467,6 +584,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         right = -left;
         break;
     }
+    maintainApproachHeading(&nav, netAngle, maxWheelSpeed, &left, &right);
     outputSpeeds(&nav, left, right, maxWheelSpeed, netDistance,
         pRightWheelSpeed, pLeftWheelSpeed);
 }
