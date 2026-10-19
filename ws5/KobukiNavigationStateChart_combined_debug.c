@@ -3,12 +3,14 @@
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
  * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地直接停车锁止。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
+ * 下坡标志锁存后独立检测落地：前后俯仰在 ±4.8° 内，最近 8 次中 6 次确认。
+ * 落地窗口在暂停和悬崖动作期间冻结，只有 B1 重置或首次确认下坡时清空。
  * 坡度采用 8 中 6 投票，保留 Y 纠偏与轮速；combined.c 保持原文件。
  * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
- * 各阶段基础轮速和纠偏速度参数直接设为原来的约 70%；输出端不再统一缩放。
+ * 基础行驶及避障轮速保持原来的约 70%；纠偏使用原参数，输出端不再统一缩放。
  * 加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地直接停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
@@ -24,6 +26,7 @@
 #define RAD_TO_DEG                       57.29577951308232
 #define PITCH_THRESHOLD_DEG              5.0
 #define LEVEL_TILT_DEG                   4.5  /* 整体倾角：同时约束前后和横向 */
+#define LANDING_PITCH_DEG                4.8  /* 下坡后的落地俯仰容差，小于 5° 坡度阈值。 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      6
 #define Y_ALIGNMENT_THRESHOLD_G          0.01
@@ -39,10 +42,11 @@
 #ifndef FINISH_DISTANCE_MM
 #define FINISH_DISTANCE_MM               200  /* 下坡确认平地后，正常直行的距离 */
 #endif
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S    280
-#define UPHILL_ALIGN_INNER_SPEED_MM_S    210
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  140
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  105
+/* Y 差速纠偏使用降速前的轮速，不额外乘 70%。 */
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S    400
+#define UPHILL_ALIGN_INNER_SPEED_MM_S    300
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  200
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  150
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
@@ -51,21 +55,21 @@
 #define OBSTACLE_REVERSE_SPEED_MM_S      168
 #define OBSTACLE_TURN_SPEED_MM_S         154
 #define HEADING_TOLERANCE_DEG            5
-#define REORIENT_MIN_SPEED_MM_S          28
-#define REORIENT_GAIN_MM_S_PER_DEG       4.2
+#define REORIENT_MIN_SPEED_MM_S          40
+#define REORIENT_GAIN_MM_S_PER_DEG       6
 
-/* 【前半段航向保持】速度相关增益和限幅同步降至 70%，角度与滤波参数保留。 */
+/* 【前半段航向保持】使用降速前的纠偏增益和限幅，在较低基础轮速上计算差速。 */
 #ifndef HEADING_ANGLE_SIGN
 #define HEADING_ANGLE_SIGN               1
 #endif
-#define HEADING_KP_MM_S_PER_DEG           1.75
-#define HEADING_KD_MM_S_PER_DEG_STEP      5.6
-#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.0105
-#define HEADING_MAX_INTEGRAL_MM_S        8.4
+#define HEADING_KP_MM_S_PER_DEG           2.5
+#define HEADING_KD_MM_S_PER_DEG_STEP      8.0
+#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.015
+#define HEADING_MAX_INTEGRAL_MM_S        12.0
 #define HEADING_YAW_RATE_FILTER_ALPHA    0.25
-#define HEADING_CORRECTION_STEP_MM_S     2.1
+#define HEADING_CORRECTION_STEP_MM_S     3.0
 #define HEADING_DEADBAND_DEG             1
-#define HEADING_MAX_CORRECTION_MM_S      28
+#define HEADING_MAX_CORRECTION_MM_S      40
 
 /* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
@@ -127,6 +131,9 @@ typedef struct {
     bool countFinishDistance;
     bool downhillFlag; /* 只在路线进入 DESCEND_RAMP 时置位，坡顶平地不能置位。 */
     bool landingFlag;  /* 只在已进入下坡之后再次确认平地时置位，B1 清除。 */
+    bool landingSamples[PITCH_WINDOW_SAMPLE_COUNT];
+    int landingIndex;
+    int landingCount;
     bool confirmingUphill; /* 坡道入口碰撞时停车确认；不改变路线或停车标志。 */
     slopeSample_t pitchSamples[PITCH_WINDOW_SAMPLE_COUNT];
     int pitchIndex;
@@ -222,7 +229,9 @@ static slopeSample_t classifySlope(const accelerometer_t accel, const bool landi
         fabs(accel.z)) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
-    if ((landingCheck ? fabs(pitch) : tilt) <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
+    if (landingCheck ? fabs(pitch) <= LANDING_PITCH_DEG : tilt <= LEVEL_TILT_DEG) {
+        return SAMPLE_LEVEL;
+    }
     return SAMPLE_UNKNOWN;
 }
 
@@ -233,8 +242,7 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     int i;
     int up = 0, down = 0, level = 0;
     routePhase_t next = nav->phase;
-    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel,
-        nav->phase == DESCEND_RAMP && nav->downhillFlag);
+    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel, false);
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
     if (nav->pitchCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->pitchCount++; }
     if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
@@ -255,25 +263,45 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (nav->downhillFlag && level >= PITCH_REQUIRED_SAMPLE_COUNT) {
-            next = FINISHED; /* 下坡确认平地后直接进入 FINISHED 停车锁止 */
-        }
+        /* 落地停车由 downhillFlag 门控的独立窗口处理。 */
         break;
     default:
         break;
     }
     if (next != nav->phase) {
         nav->phase = next;
-        if (next == DESCEND_RAMP) { nav->downhillFlag = true; }
+        if (next == DESCEND_RAMP && !nav->downhillFlag) {
+            nav->downhillFlag = true;
+            nav->landingIndex = nav->landingCount = 0;
+        }
         resetVotes(nav);
         /* 上坡期间关闭原地面避障动作；悬崖动作在本函数调用前已排除。 */
         if (!onGround(next)) { nav->motion = ROUTE_DRIVE; }
-        if (next == FINISH_STRAIGHT || next == FINISHED) {
-            nav->landingFlag = true;
-            nav->finishDistance = 0;
-            nav->countFinishDistance = false;
-            nav->routeHeading = angle;
-        }
+    }
+    (void)angle;
+}
+
+/* 【独立落地停车】只依赖已锁存的下坡标志，不再要求路线仍为 DESCEND_RAMP。
+ * 调用方只在正常行驶、没有悬崖报警时采样。无效读数占窗口但不算平地票。
+ * 本窗口不随 resetVotes/resetCliffVotes 清空，暂停和避让后接着检测。
+ */
+static void updateLanding(navigation_t * const nav, const accelerometer_t accel)
+{
+    int i;
+    int level = 0;
+    if (!nav->downhillFlag || nav->landingFlag) { return; }
+    nav->landingSamples[nav->landingIndex] = classifySlope(accel, true) == SAMPLE_LEVEL;
+    nav->landingIndex = (nav->landingIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
+    if (nav->landingCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->landingCount++; }
+    if (nav->landingCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
+    for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
+        if (nav->landingSamples[i]) { level++; }
+    }
+    if (level >= PITCH_REQUIRED_SAMPLE_COUNT) {
+        nav->landingFlag = true;
+        nav->phase = FINISHED;
+        nav->motion = ROUTE_DRIVE;
+        nav->countFinishDistance = false;
     }
 }
 
@@ -454,7 +482,8 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         nav.phase = FINISHED;
     }
     /* 【终点锁止】优先于 B0、bumper 和悬崖；任何输入都不能自动复跑。 */
-    if (nav.phase == FINISHED) {
+    if (nav.landingFlag || nav.phase == FINISHED) {
+        nav.phase = FINISHED;
         outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
             pRightWheelSpeed, pLeftWheelSpeed);
         return;
@@ -496,6 +525,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT && nav.phase != FINISHED) {
         updateRoute(&nav, accelAxes, netAngle);
+    }
+    /* 下坡标志一旦置位就持续检测落地；暂停、倒车和转向都不更新窗口。 */
+    if (!cliff && nav.motion == ROUTE_DRIVE && !nav.confirmingUphill) {
+        updateLanding(&nav, accelAxes);
         if (nav.phase == FINISHED) {
             outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
                 pRightWheelSpeed, pLeftWheelSpeed);
