@@ -8,7 +8,7 @@
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
- * 各阶段基础轮速和纠偏速度参数直接设为原来的约 70%；输出端不再统一缩放。
+ * 基础行驶及避障轮速保持原来的约 70%；纠偏使用原参数，输出端不再统一缩放。
  * 加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地直接停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
@@ -41,10 +41,11 @@
 #ifndef FINISH_DISTANCE_MM
 #define FINISH_DISTANCE_MM               200  /* 下坡确认平地后，正常直行的距离 */
 #endif
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S    280
-#define UPHILL_ALIGN_INNER_SPEED_MM_S    210
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  140
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  105
+/* Y 差速纠偏使用降速前的轮速，不额外乘 70%。 */
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S    400
+#define UPHILL_ALIGN_INNER_SPEED_MM_S    300
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  200
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  150
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
@@ -53,21 +54,21 @@
 #define OBSTACLE_REVERSE_SPEED_MM_S      168
 #define OBSTACLE_TURN_SPEED_MM_S         154
 #define HEADING_TOLERANCE_DEG            5
-#define REORIENT_MIN_SPEED_MM_S          28
-#define REORIENT_GAIN_MM_S_PER_DEG       4.2
+#define REORIENT_MIN_SPEED_MM_S          40
+#define REORIENT_GAIN_MM_S_PER_DEG       6
 
-/* 【前半段航向保持】速度相关增益和限幅同步降至 70%，角度与滤波参数保留。 */
+/* 【前半段航向保持】使用降速前的纠偏增益和限幅，在较低基础轮速上计算差速。 */
 #ifndef HEADING_ANGLE_SIGN
 #define HEADING_ANGLE_SIGN               1
 #endif
-#define HEADING_KP_MM_S_PER_DEG           1.75
-#define HEADING_KD_MM_S_PER_DEG_STEP      5.6
-#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.0105
-#define HEADING_MAX_INTEGRAL_MM_S        8.4
+#define HEADING_KP_MM_S_PER_DEG           2.5
+#define HEADING_KD_MM_S_PER_DEG_STEP      8.0
+#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.015
+#define HEADING_MAX_INTEGRAL_MM_S        12.0
 #define HEADING_YAW_RATE_FILTER_ALPHA    0.25
-#define HEADING_CORRECTION_STEP_MM_S     2.1
+#define HEADING_CORRECTION_STEP_MM_S     3.0
 #define HEADING_DEADBAND_DEG             1
-#define HEADING_MAX_CORRECTION_MM_S      28
+#define HEADING_MAX_CORRECTION_MM_S      40
 
 /* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
