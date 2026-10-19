@@ -1,16 +1,18 @@
 /*
- * WS5 + 地面避障完整控制器：版本 1.0。
- * 版本来源：GitHub ws5/KobukiNavigationStateChart_combined_debug.c。
- * 本版本同步覆盖到 KobukiNavigationStateChart_combined.c，两个文件内容一致。
- * 【1.0 已知问题（实机反馈，待排查修复）】
- * 1. 下坡到达平地后没有停车。
- * 2. 上坡、下坡时未观察到 Y 轴检测/纠偏生效。
- * 注意：源码已有平地定距停车及 Y 轴检测分支，上述现象的原因尚未确认。
- * 本次仅标注版本、记录问题并同步文件，不表示上述问题已修复。
+ * WS5 + 地面避障完整控制器：版本 1.1。
+ * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
+ * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地置 landingFlag。
+ * landingFlag 置位后才按原流程正常直行 200 mm，达到距离输出零轮速并锁止。
+ * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
+ * 保留坡度阈值、8 中 7 投票、Y 纠偏与轮速；combined.c 保持原文件。
+ * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
+ * 碰撞同时读到上坡时先停车，重新收满 8 次读数：7 票上坡才进入爬坡。
+ * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
  * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
+ * 坡道悬崖避让保留坡度投票，动作期间暂停采样，结束后接着判断下坡/落地。
  * 本文件替换工程中的原状态机源文件，不与其他同名接口实现一起编译。
  */
 #include "KobukiNavigationStateChart.h"
@@ -24,9 +26,11 @@
 #define LEVEL_TILT_DEG                   3.0  /* 整体倾角：同时约束前后和横向 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      7
-#define Y_ALIGNMENT_THRESHOLD_G         0.01
+#define Y_ALIGNMENT_THRESHOLD_G          0.005
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
+#define Y_CORRECTION_MAX_DURATION_MS     2000  /* 持续纠偏最大时间：2秒超时强制退出 */
+#define Y_CORRECTION_COOLDOWN_MS         1000  /* 超时退出后的平稳直行冷却时间 */
 
 /* 【路线轮速】先按阶段选择，再应用 Y 纠偏和固定轮速补偿。 */
 #define APPROACH_SPEED_MM_S              400
@@ -123,27 +127,32 @@ typedef struct {
     int32_t lastDistance;
     int32_t finishDistance;
     bool countFinishDistance;
+    bool downhillFlag; /* 只在路线进入 DESCEND_RAMP 时置位，坡顶平地不能置位。 */
+    bool landingFlag;  /* 只在已进入下坡之后再次确认平地时置位，B1 清除。 */
+    bool confirmingUphill; /* 坡道入口碰撞时停车确认；不改变路线或停车标志。 */
     slopeSample_t pitchSamples[PITCH_WINDOW_SAMPLE_COUNT];
     int pitchIndex;
     int pitchCount;
     int ySamples[Y_FILTER_SAMPLE_COUNT];
     int yIndex;
     int yCount;
+    uint32_t yCorrectionDurationMs;
+    uint32_t yCooldownMs;
+    uint16_t lastTimeStamp;
 } navigation_t;
 
-/* 【通用控制】所有轮速均受调用方 maxWheelSpeed 限制。 */
+/* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
 static int16_t limitSpeed(const int16_t speed, const int16_t maximum)
 {
-    if (maximum <= 0) { return 0; }
-    return speed < maximum ? speed : maximum;
+    (void)maximum;
+    return speed;
 }
 
 static int16_t trimWheelSpeed(const int16_t speed, const double boost,
     const int16_t maximum)
 {
     double magnitude = floor(fabs((double)speed) * (1.0 + boost) + 0.5);
-    if (maximum <= 0) { return 0; }
-    if (magnitude > maximum) { magnitude = maximum; }
+    (void)maximum;
     return (int16_t)(speed < 0 ? -magnitude : magnitude);
 }
 
@@ -168,11 +177,14 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 暂停、避让、路线切换后重新收满窗口，不沿用旧的坡度或 Y 证据。 */
+/* 暂停、地面碰撞、路线切换后重新收满坡度和 Y 窗口。 */
 static void resetVotes(navigation_t * const nav)
 {
+    nav->confirmingUphill = false;
     nav->pitchIndex = nav->pitchCount = 0;
     nav->yIndex = nav->yCount = 0;
+    nav->yCorrectionDurationMs = 0;
+    nav->yCooldownMs = 0;
 }
 
 static void resetRun(navigation_t * const nav, const int32_t distance,
@@ -188,6 +200,21 @@ static void resetRun(navigation_t * const nav, const int32_t distance,
 static bool onGround(const routePhase_t phase)
 {
     return phase == APPROACH_RAMP || phase == FINISH_STRAIGHT;
+}
+
+/* 【悬崖窗口】坡道上保留坡度票和写入位置，避免下坡/落地确认反复重来。
+ * 入口确认、Y 投票与纠偏计时均清除；地面仍丢弃未确认的坡度证据。
+ * 悬崖倒车和转向期间不调用 updateRoute，不会写入新的坡度票。
+ */
+static void resetCliffVotes(navigation_t * const nav)
+{
+    nav->confirmingUphill = false;
+    nav->yIndex = nav->yCount = 0;
+    nav->yCorrectionDurationMs = 0;
+    nav->yCooldownMs = 0;
+    if (onGround(nav->phase)) {
+        nav->pitchIndex = nav->pitchCount = 0;
+    }
 }
 
 /* 【坡度判断】横着处于斜坡不能算平地；过小/过大的合加速度不投有效票。 */
@@ -207,7 +234,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
     return SAMPLE_UNKNOWN;
 }
 
-/* 【路线阶段】只在正常前进或地面绕行前进时判断，倒车/转向不推进阶段。 */
+/* 【路线阶段】正常/绕障直行及入口停车确认时采样，倒车/转向不推进阶段。 */
 static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     const int32_t angle)
 {
@@ -235,17 +262,21 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = FINISH_STRAIGHT; }
+        if (nav->downhillFlag && level >= PITCH_REQUIRED_SAMPLE_COUNT) {
+            next = FINISH_STRAIGHT;
+        }
         break;
     default:
         break;
     }
     if (next != nav->phase) {
         nav->phase = next;
+        if (next == DESCEND_RAMP) { nav->downhillFlag = true; }
         resetVotes(nav);
         /* 上坡期间关闭原地面避障动作；悬崖动作在本函数调用前已排除。 */
         if (!onGround(next)) { nav->motion = ROUTE_DRIVE; }
         if (next == FINISH_STRAIGHT) {
+            nav->landingFlag = true;
             nav->finishDistance = 0;
             nav->countFinishDistance = false;
             nav->routeHeading = angle;
@@ -301,11 +332,11 @@ static void beginCliff(navigation_t * const nav, const KobukiSensors_t sensors,
     nav->turnRight = sensors.cliffLeft || sensors.cliffCenter;
     nav->maneuverDistance = distance;
     nav->motion = CLIFF_BACKUP;
-    resetVotes(nav);
+    resetCliffVotes(nav);
 }
 
 /* 【前半段直行/绕行纠偏】正常直行锁定路线航向，绕行锁定转向完成时的航向。
- * 保留配置的基础速度；达到调用方轮速上限时，两轮同时减去超出量，保持差速。
+ * 保留配置的基础速度；已移除调用方轮速上限截断，保持两轮差速纠偏。
  * 和参考文件一样，KD 与积分按调用次数计算，调用周期变化会影响实际纠偏效果。
  */
 static void maintainApproachHeading(navigation_t * const nav, const int32_t angle,
@@ -313,7 +344,8 @@ static void maintainApproachHeading(navigation_t * const nav, const int32_t angl
 {
     int32_t target;
     double error, yawStep = 0.0, correction, correctionLimit, baseSpeed;
-    double requestedLeft, requestedRight, excess;
+    double requestedLeft, requestedRight;
+    (void)maximum;
     if (nav->phase != APPROACH_RAMP || (nav->motion != ROUTE_DRIVE
             && nav->motion != OBSTACLE_CLEAR)) {
         nav->headingControlActive = false;
@@ -364,8 +396,6 @@ static void maintainApproachHeading(navigation_t * const nav, const int32_t angl
     nav->previousCorrection = correction;
     requestedLeft = baseSpeed + correction;
     requestedRight = baseSpeed - correction;
-    excess = (requestedLeft > requestedRight ? requestedLeft : requestedRight) - maximum;
-    if (excess > 0.0) { requestedLeft -= excess; requestedRight -= excess; }
     if (requestedLeft < 0.0) { requestedLeft = 0.0; }
     if (requestedRight < 0.0) { requestedRight = 0.0; }
     *left = (int16_t)floor(requestedLeft + 0.5);
@@ -380,7 +410,7 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     *pLeft = trimWheelSpeed(left, WHEEL_SPEED_TRIM < 0 ? -WHEEL_SPEED_TRIM : 0, maximum);
     *pRight = trimWheelSpeed(right, WHEEL_SPEED_TRIM > 0 ? WHEEL_SPEED_TRIM : 0, maximum);
     nav->lastDistance = distance;
-    nav->countFinishDistance = nav->phase == FINISH_STRAIGHT
+    nav->countFinishDistance = nav->landingFlag && nav->phase == FINISH_STRAIGHT
         && nav->button == RUNNING && nav->motion == ROUTE_DRIVE
         && *pLeft > 0 && *pRight > 0;
     if (nav->button != RUNNING) { nav->headingControlActive = false; }
@@ -398,11 +428,18 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     int32_t error;
     int32_t reorientSpeed;
     int64_t delta;
+    uint16_t dtMs = 64;
     bool cliff = sensors.cliffLeft || sensors.cliffCenter || sensors.cliffRight;
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
     bool turnCompleted;
     (void)isSimulator;
+
+    if (sensors.TimeStamp != 0 && nav.lastTimeStamp != 0) {
+        uint16_t diff = (uint16_t)(sensors.TimeStamp - nav.lastTimeStamp);
+        if (diff > 0 && diff < 500) { dtMs = diff; }
+    }
+    nav.lastTimeStamp = sensors.TimeStamp;
 
     /* B1 重置后仍为停车等待状态，必须重新按下并松开 B0。 */
     if (!nav.initialized || sensors.buttons.B1) {
@@ -424,7 +461,8 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             else { nav.finishDistance += (int32_t)delta; }
         }
     }
-    if (nav.phase == FINISH_STRAIGHT && nav.finishDistance >= FINISH_DISTANCE_MM) {
+    if (nav.landingFlag && nav.phase == FINISH_STRAIGHT
+        && nav.finishDistance >= FINISH_DISTANCE_MM) {
         nav.phase = FINISHED;
     }
     /* 【终点锁止】优先于 B0、bumper 和悬崖；任何输入都不能自动复跑。 */
@@ -466,10 +504,24 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (cliff && nav.motion != CLIFF_BACKUP && nav.motion != CLIFF_TURN) {
         beginCliff(&nav, sensors, netDistance);
     }
-    /* 前半段按参考文件先完成整轮碰撞避障，再推进坡道阶段。 */
-    if (!cliff && nav.motion == ROUTE_DRIVE
+    /* 绕障直行也可能驶上坡道；坡度确认优先于本周期的碰撞倒车。 */
+    if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT) {
         updateRoute(&nav, accelAxes, netAngle);
+    }
+
+    /* 【入口确认】轮速保持零，使用碰撞之后新收集的完整 8 次读数。
+     * updateRoute 达到 7 票时会切到 CLIMB_RAMP，并通过 resetVotes 退出确认。
+     * 收满后仍未确认，就恢复地面处理；不因持续碰撞反复重开确认窗口。
+     */
+    if (nav.confirmingUphill) {
+        if (nav.pitchCount < PITCH_WINDOW_SAMPLE_COUNT) {
+            outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
+                pRightWheelSpeed, pLeftWheelSpeed);
+            return;
+        }
+        resetVotes(&nav);
+        if (bumper) { beginObstacle(&nav, sensors, netDistance, netAngle); }
     }
     if (nav.motion == CLIFF_BACKUP
         && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
@@ -482,8 +534,22 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else {
             nav.motion = ROUTE_DRIVE;
             nav.routeHeading = netAngle; /* 不回到刚才朝向悬崖的旧航向 */
-            resetVotes(&nav);
+            resetCliffVotes(&nav);
         }
+    }
+
+    /* 只在前进遇到疑似上坡碰撞时暂停确认；单次倾角不直接关闭碰撞避障。
+     * 悬崖已经抢占动作；地面倒车、转向仍按原流程完成。
+     */
+    if (nav.phase == APPROACH_RAMP && bumper
+        && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
+        && classifySlope(accelAxes) == SAMPLE_UPHILL) {
+        resetVotes(&nav);
+        nav.confirmingUphill = true;
+        nav.headingControlActive = false;
+        outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
+            pRightWheelSpeed, pLeftWheelSpeed);
+        return;
     }
 
     /* 【地面避障】上坡、坡顶、下坡完全跳过 bumper 处理。 */
@@ -527,7 +593,28 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.phase == FINISH_STRAIGHT) { speed = FINISH_SPEED_MM_S; }
         left = right = limitSpeed(speed, maxWheelSpeed);
         if (nav.phase == CLIMB_RAMP || nav.phase == DESCEND_RAMP) {
-            correction = updateY(&nav, accelAxes.y);
+            if (nav.yCooldownMs > 0) {
+                if (nav.yCooldownMs > dtMs) { nav.yCooldownMs -= dtMs; }
+                else { nav.yCooldownMs = 0; }
+                correction = 0;
+            }
+            else {
+                correction = updateY(&nav, accelAxes.y);
+                if (correction != 0) {
+                    nav.yCorrectionDurationMs += dtMs;
+                    if (nav.yCorrectionDurationMs >= Y_CORRECTION_MAX_DURATION_MS) {
+                        /* 持续纠偏满 2 秒：强制退出差速并重置采样窗口，进入平稳直行冷却 */
+                        correction = 0;
+                        nav.yIndex = nav.yCount = 0;
+                        nav.yCorrectionDurationMs = 0;
+                        nav.yCooldownMs = Y_CORRECTION_COOLDOWN_MS;
+                    }
+                }
+                else {
+                    /* 自然退出差速：Y轴回正，重置纠偏持续时间 */
+                    nav.yCorrectionDurationMs = 0;
+                }
+            }
             if (correction != 0) {
                 if (nav.phase == CLIMB_RAMP) {
                     left = limitSpeed(correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S
