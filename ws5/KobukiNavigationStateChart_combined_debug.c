@@ -28,6 +28,8 @@
 #define Y_ALIGNMENT_THRESHOLD_G          0.005
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
+#define Y_CORRECTION_MAX_DURATION_MS     2000  /* 持续纠偏最大时间：2秒超时强制退出 */
+#define Y_CORRECTION_COOLDOWN_MS         1000  /* 超时退出后的平稳直行冷却时间 */
 
 /* 【路线轮速】先按阶段选择，再应用 Y 纠偏和固定轮速补偿。 */
 #define APPROACH_SPEED_MM_S              400
@@ -133,6 +135,9 @@ typedef struct {
     int ySamples[Y_FILTER_SAMPLE_COUNT];
     int yIndex;
     int yCount;
+    uint32_t yCorrectionDurationMs;
+    uint32_t yCooldownMs;
+    uint16_t lastTimeStamp;
 } navigation_t;
 
 /* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
@@ -177,6 +182,8 @@ static void resetVotes(navigation_t * const nav)
     nav->confirmingUphill = false;
     nav->pitchIndex = nav->pitchCount = 0;
     nav->yIndex = nav->yCount = 0;
+    nav->yCorrectionDurationMs = 0;
+    nav->yCooldownMs = 0;
 }
 
 static void resetRun(navigation_t * const nav, const int32_t distance,
@@ -405,11 +412,18 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     int32_t error;
     int32_t reorientSpeed;
     int64_t delta;
+    uint16_t dtMs = 64;
     bool cliff = sensors.cliffLeft || sensors.cliffCenter || sensors.cliffRight;
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
     bool turnCompleted;
     (void)isSimulator;
+
+    if (sensors.TimeStamp != 0 && nav.lastTimeStamp != 0) {
+        uint16_t diff = (uint16_t)(sensors.TimeStamp - nav.lastTimeStamp);
+        if (diff > 0 && diff < 500) { dtMs = diff; }
+    }
+    nav.lastTimeStamp = sensors.TimeStamp;
 
     /* B1 重置后仍为停车等待状态，必须重新按下并松开 B0。 */
     if (!nav.initialized || sensors.buttons.B1) {
@@ -563,7 +577,28 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.phase == FINISH_STRAIGHT) { speed = FINISH_SPEED_MM_S; }
         left = right = limitSpeed(speed, maxWheelSpeed);
         if (nav.phase == CLIMB_RAMP || nav.phase == DESCEND_RAMP) {
-            correction = updateY(&nav, accelAxes.y);
+            if (nav.yCooldownMs > 0) {
+                if (nav.yCooldownMs > dtMs) { nav.yCooldownMs -= dtMs; }
+                else { nav.yCooldownMs = 0; }
+                correction = 0;
+            }
+            else {
+                correction = updateY(&nav, accelAxes.y);
+                if (correction != 0) {
+                    nav.yCorrectionDurationMs += dtMs;
+                    if (nav.yCorrectionDurationMs >= Y_CORRECTION_MAX_DURATION_MS) {
+                        /* 持续纠偏满 2 秒：强制退出差速并重置采样窗口，进入平稳直行冷却 */
+                        correction = 0;
+                        nav.yIndex = nav.yCount = 0;
+                        nav.yCorrectionDurationMs = 0;
+                        nav.yCooldownMs = Y_CORRECTION_COOLDOWN_MS;
+                    }
+                }
+                else {
+                    /* 自然退出差速：Y轴回正，重置纠偏持续时间 */
+                    nav.yCorrectionDurationMs = 0;
+                }
+            }
             if (correction != 0) {
                 if (nav.phase == CLIMB_RAMP) {
                     left = limitSpeed(correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S
