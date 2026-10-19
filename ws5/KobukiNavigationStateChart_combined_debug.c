@@ -49,7 +49,7 @@
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
-#define OBSTACLE_CLEAR_DISTANCE_MM       300
+#define OBSTACLE_CLEAR_DISTANCE_MM       240
 #define OBSTACLE_TURN_ANGLE_DEG          80
 #define OBSTACLE_REVERSE_SPEED_MM_S      168
 #define OBSTACLE_TURN_SPEED_MM_S         154

@@ -140,6 +140,7 @@ typedef struct {
     int32_t yCorrectionDurationMs;
     int32_t yCooldownMs;
     int32_t lastTimeStamp; /* 用有符号 32 位保存完整的 16 位时间戳。 */
+    int levelGroundCount;  /* 拿到下坡flag后，平地持续检测计数器 */
 } navigation_t;
 
 /* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
@@ -186,6 +187,7 @@ static void resetVotes(navigation_t * const nav)
     nav->yIndex = nav->yCount = 0;
     nav->yCorrectionDurationMs = 0;
     nav->yCooldownMs = 0;
+    nav->levelGroundCount = 0;
 }
 
 static void resetRun(navigation_t * const nav, const int32_t distance,
@@ -218,8 +220,8 @@ static void resetCliffVotes(navigation_t * const nav)
     }
 }
 
-/* 【坡度判断】通常按整体倾角判平地；已确认下坡后仅按前后俯仰判落地。
- * 过小/过大的合加速度不投有效票。落地判断不受 Y 轴倾角直接限制。
+/* 【坡度判断】通常按整体倾角判平地；已确认下坡后按前后俯仰持续判落地。
+ * 放宽落地判断时的合加速度范围与俯仰阈值，彻底消除死区并吸收接缝冲击。
  */
 static slopeSample_t classifySlope(const accelerometer_t accel, const bool landingCheck)
 {
@@ -227,13 +229,21 @@ static slopeSample_t classifySlope(const accelerometer_t accel, const bool landi
     double magnitude = sqrt(accel.x * accel.x + lateral * lateral);
     double pitch;
     double tilt;
-    if (!(magnitude >= 0.5 && magnitude <= 1.5)) { return SAMPLE_UNKNOWN; }
+    double magMin = landingCheck ? 0.3 : 0.5;
+    double magMax = landingCheck ? 2.2 : 1.5;
+    if (!(magnitude >= magMin && magnitude <= magMax)) { return SAMPLE_UNKNOWN; }
     pitch = atan2(accel.x, lateral) * RAD_TO_DEG;
     tilt = atan2(sqrt(accel.x * accel.x + accel.y * accel.y),
         fabs(accel.z)) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
-    if ((landingCheck ? fabs(pitch) : tilt) <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
+    if (landingCheck) {
+        if (pitch > -PITCH_THRESHOLD_DEG && pitch < PITCH_THRESHOLD_DEG) {
+            return SAMPLE_LEVEL;
+        }
+    } else {
+        if (tilt <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
+    }
     return SAMPLE_UNKNOWN;
 }
 
@@ -244,35 +254,63 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     int i;
     int up = 0, down = 0, level = 0;
     routePhase_t next = nav->phase;
-    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel,
-        nav->phase == DESCEND_RAMP && nav->downhillFlag);
+    slopeSample_t currentSample = classifySlope(accel, nav->downhillFlag);
+
+    nav->pitchSamples[nav->pitchIndex] = currentSample;
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
     if (nav->pitchCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->pitchCount++; }
-    if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
-    for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
+
+    for (i = 0; i < nav->pitchCount; i++) {
         if (nav->pitchSamples[i] == SAMPLE_UPHILL) { up++; }
         else if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { down++; }
         else if (nav->pitchSamples[i] == SAMPLE_LEVEL) { level++; }
     }
+
+    /* 【获得下坡 flag】爬坡中或坡顶，检测到下坡趋势（4票下坡），立即锁存下坡标志 */
+    if (!nav->downhillFlag && (nav->phase == CLIMB_RAMP || nav->phase == DRIVE_ACROSS_TOP)) {
+        if (down >= 4) {
+            nav->downhillFlag = true;
+            next = DESCEND_RAMP;
+        }
+    }
+
+    /* 【拿到下坡 flag 后的平地持续检测】
+     * 只要已获得下坡 flag，在平地上全程持续检测；
+     * 当车身脱离下坡（最新样本为平地）时持续累加；当下坡时清零。
+     * 连续 3 拍或窗口满 4 票平地，直接判定到达平地停车锁止。
+     */
+    if (nav->downhillFlag) {
+        if (currentSample == SAMPLE_LEVEL) {
+            nav->levelGroundCount++;
+        }
+        else if (currentSample == SAMPLE_DOWNHILL) {
+            nav->levelGroundCount = 0;
+        }
+        if (nav->levelGroundCount >= 3 || level >= 4) {
+            next = FINISHED;
+        }
+    }
+
     switch (nav->phase) {
     case APPROACH_RAMP:
         if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
         break;
     case CLIMB_RAMP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
+        if (down >= 4) { next = DESCEND_RAMP; }
         else if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
         break;
     case DRIVE_ACROSS_TOP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
+        if (down >= 4) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (nav->downhillFlag && level >= PITCH_REQUIRED_SAMPLE_COUNT) {
-            next = FINISHED; /* 下坡确认平地后直接进入 FINISHED 停车锁止 */
+        if (nav->downhillFlag && (nav->levelGroundCount >= 3 || level >= 4)) {
+            next = FINISHED;
         }
         break;
     default:
         break;
     }
+
     if (next != nav->phase) {
         nav->phase = next;
         if (next == DESCEND_RAMP) { nav->downhillFlag = true; }
