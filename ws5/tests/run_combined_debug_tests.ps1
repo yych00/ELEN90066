@@ -20,6 +20,8 @@ $scenarios = @(
     'approach_heading_target', 'clear_heading_hold', 'clear_distance_direction',
     'repeated_collision_heading',
     'landing_flags_reset',
+    'ramp_bumper_entry', 'ramp_bumper_clear', 'ramp_bumper_impulse',
+    'ramp_bumper_vote_limit', 'ramp_bumper_pause', 'ramp_bumper_cliff', 'ramp_bumper_release',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
 )

@@ -1,10 +1,13 @@
 /*
- * WS5 + 地面避障完整控制器：恢复版本 1.0，仅增加停车标志。
+ * WS5 + 地面避障完整控制器：基于版本 1.0 修复上坡入口与停车标志。
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
  * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地置 landingFlag。
  * landingFlag 置位后才按原流程正常直行 200 mm，达到距离输出零轮速并锁止。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
- * 避障、上下坡检测、Y 纠偏、轮速均恢复为 1.0；combined.c 保持原文件。
+ * 保留 1.0 的坡度阈值、8 中 7 投票、Y 纠偏与轮速；combined.c 保持原文件。
+ * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
+ * 碰撞同时读到上坡时先停车，重新收满 8 次读数：7 票上坡才进入爬坡。
+ * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
  * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
@@ -123,6 +126,7 @@ typedef struct {
     bool countFinishDistance;
     bool downhillFlag; /* 只在路线进入 DESCEND_RAMP 时置位，坡顶平地不能置位。 */
     bool landingFlag;  /* 只在已进入下坡之后再次确认平地时置位，B1 清除。 */
+    bool confirmingUphill; /* 坡道入口碰撞时停车确认；不改变路线或停车标志。 */
     slopeSample_t pitchSamples[PITCH_WINDOW_SAMPLE_COUNT];
     int pitchIndex;
     int pitchCount;
@@ -168,9 +172,10 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 暂停、避让、路线切换后重新收满窗口，不沿用旧的坡度或 Y 证据。 */
+/* 暂停、避让、路线切换后清除入口确认，重新收满坡度和 Y 窗口。 */
 static void resetVotes(navigation_t * const nav)
 {
+    nav->confirmingUphill = false;
     nav->pitchIndex = nav->pitchCount = 0;
     nav->yIndex = nav->yCount = 0;
 }
@@ -207,7 +212,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
     return SAMPLE_UNKNOWN;
 }
 
-/* 【路线阶段】只在正常前进或地面绕行前进时判断，倒车/转向不推进阶段。 */
+/* 【路线阶段】正常/绕障直行及入口停车确认时采样，倒车/转向不推进阶段。 */
 static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     const int32_t angle)
 {
@@ -471,10 +476,24 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     if (cliff && nav.motion != CLIFF_BACKUP && nav.motion != CLIFF_TURN) {
         beginCliff(&nav, sensors, netDistance);
     }
-    /* 前半段按参考文件先完成整轮碰撞避障，再推进坡道阶段。 */
-    if (!cliff && nav.motion == ROUTE_DRIVE
+    /* 绕障直行也可能驶上坡道；坡度确认优先于本周期的碰撞倒车。 */
+    if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT) {
         updateRoute(&nav, accelAxes, netAngle);
+    }
+
+    /* 【入口确认】轮速保持零，使用碰撞之后新收集的完整 8 次读数。
+     * updateRoute 达到 7 票时会切到 CLIMB_RAMP，并通过 resetVotes 退出确认。
+     * 收满后仍未确认，就恢复地面处理；不因持续碰撞反复重开确认窗口。
+     */
+    if (nav.confirmingUphill) {
+        if (nav.pitchCount < PITCH_WINDOW_SAMPLE_COUNT) {
+            outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
+                pRightWheelSpeed, pLeftWheelSpeed);
+            return;
+        }
+        resetVotes(&nav);
+        if (bumper) { beginObstacle(&nav, sensors, netDistance, netAngle); }
     }
     if (nav.motion == CLIFF_BACKUP
         && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
@@ -489,6 +508,20 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             nav.routeHeading = netAngle; /* 不回到刚才朝向悬崖的旧航向 */
             resetVotes(&nav);
         }
+    }
+
+    /* 只在前进遇到疑似上坡碰撞时暂停确认；单次倾角不直接关闭碰撞避障。
+     * 悬崖已经抢占动作；地面倒车、转向仍按原流程完成。
+     */
+    if (nav.phase == APPROACH_RAMP && bumper
+        && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
+        && classifySlope(accelAxes) == SAMPLE_UPHILL) {
+        resetVotes(&nav);
+        nav.confirmingUphill = true;
+        nav.headingControlActive = false;
+        outputSpeeds(&nav, 0, 0, maxWheelSpeed, netDistance,
+            pRightWheelSpeed, pLeftWheelSpeed);
+        return;
     }
 
     /* 【地面避障】上坡、坡顶、下坡完全跳过 bumper 处理。 */
