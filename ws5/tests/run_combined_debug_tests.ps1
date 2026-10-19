@@ -24,6 +24,8 @@ $scenarios = @(
     'stop_floor_bias', 'stop_shallow_descent', 'stop_noisy_level', 'stop_reject_five_level_votes',
     'stop_reject_top', 'stop_pause_keeps_descent', 'stop_reference_fixed_on_resume',
     'stop_start_reference_guard', 'stop_invalid_level', 'stop_latest_level_required', 'stop_vote_outlier_last',
+    'crest_braking_before_top', 'crest_braking_after_top', 'crest_repeated_pulses',
+    'descent_distance_threshold', 'descent_pause_resets_candidate', 'descent_invalid_gap', 'descent_distance_wrap',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
 )

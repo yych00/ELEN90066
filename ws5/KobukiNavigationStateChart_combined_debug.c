@@ -1,15 +1,16 @@
 /*
- * WS5 + 地面避障完整控制器：版本 1.2，combined.c 保留 1.0 对照。
- * 独立停车：启动前静止采集地面基准 -> 上坡证据 -> 下坡锁存 -> 回到地面 -> 直行 200 mm。
- * 主坡度仍为 8 中 7；独立下坡门槛 -3.5 度、8 中 7，落地为相对倾角 3 度内、8 中 6。
+ * WS5 + 地面避障完整控制器：版本 1.3，combined.c 保留 1.0 对照。
+ * 停车顺序：启动地面基准 -> 上坡 -> 确认坡顶平地 -> 负坡度投票且前进达到下坡确认距离
+ * -> 锁存下坡 -> 再次确认平地 -> 正常直行 FINISH_DISTANCE_MM -> 停车锁止。
+ * 投票、角度和距离均以下方参数宏为准，修改参数后无需另改数字说明。
  * B1 清除地面基准和停车记录；暂停/避让清空停车投票，但不丢弃已确认的下坡。
  * 修复：绕行可确认上坡；限速保留 Y 差速；回正越过目标后反向；终点计距支持回绕。
  * 加速度提供单位、轴映射及安装偏角配置，未知实机输入时保留默认 g 单位。
  * Eclipse 可查看 kobukiDebug：阶段、传感器、投票、计距、轮速；不依赖 LED/myRIO 头文件。
  * 1.0 实机反馈为下坡不停车、Y 纠偏不生效；本版修复可复现代码问题，仍需实机验收。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
- * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
- * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
+ * 轮速沿用原两倍配置；加速度单位 g，距离 mm，轮速 mm/s，路线与停车顺序如下。
+ * 流程：接近坡道 -> 上坡 -> 坡顶直行 -> 下坡 -> 平地定距 -> 停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
  * 本文件替换工程中的原状态机源文件，不与其他同名接口实现一起编译。
  */
@@ -23,23 +24,27 @@
 #define PITCH_THRESHOLD_DEG              5.0
 #define LEVEL_TILT_DEG                   3.0  /* 整体倾角：同时约束前后和横向 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
-#define PITCH_REQUIRED_SAMPLE_COUNT      7
-#define Y_ALIGNMENT_THRESHOLD_G         0.006 /* 更灵敏：进入/退出共用五次窗口、三票门槛 */
-#define Y_FILTER_SAMPLE_COUNT            5
-#define Y_REQUIRED_SAMPLE_COUNT          3
+#define PITCH_REQUIRED_SAMPLE_COUNT      6
+#define Y_ALIGNMENT_THRESHOLD_G          0.002 /* 进入/退出共用 Y_FILTER_SAMPLE_COUNT 窗口和 Y_REQUIRED_SAMPLE_COUNT 票数 */
+#define Y_FILTER_SAMPLE_COUNT            3
+#define Y_REQUIRED_SAMPLE_COUNT          2
 
 /* 【独立停车参数】启动在初始平面，静止输出零轮速时自动建立基准，不增加低速落地阶段。
- * 地面参考使用 8 个稳定重力方向；只在首次启动前采集，行驶/恢复时绝不重新校准。
- * 路线识别保留 8 中 7；停车单独容忍落地窗口里的两次振动，不依赖主状态先到 DESCEND。
+ * 地面参考使用 FLOOR_REFERENCE_SAMPLE_COUNT 个稳定重力方向；行驶/恢复时绝不重新校准。
+ * 停车使用 FINISH_VOTE_SAMPLE_COUNT 窗口及各 REQUIRED 票数；坡顶确认本身不会启动停车。
+ * 下坡候选只累计相邻有效负坡度样本之间的正向里程，回到平地/正坡时取消候选。
  */
-#define FLOOR_REFERENCE_SAMPLE_COUNT     8
+#define FLOOR_REFERENCE_SAMPLE_COUNT     5
 #define FLOOR_REFERENCE_STABILITY_DEG    2.0
-#define FINISH_VOTE_SAMPLE_COUNT         8
-#define FINISH_UP_REQUIRED               7
-#define FINISH_DOWN_REQUIRED             7
-#define FINISH_LEVEL_REQUIRED            6
+#define FINISH_VOTE_SAMPLE_COUNT         5
+#define FINISH_UP_REQUIRED               4
+#define FINISH_DOWN_REQUIRED             4
+#define FINISH_LEVEL_REQUIRED            4
 #define FINISH_DOWN_PITCH_DEG            -3.5
 #define FINISH_LEVEL_TILT_DEG            3.0
+#ifndef FINISH_DESCENT_MIN_DISTANCE_MM
+#define FINISH_DESCENT_MIN_DISTANCE_MM   150 /* 下坡确认距离；须小于实际坡道的有效下坡长度 */
+#endif
 
 /* 【实机输入配置】轴编号 0=X、1=Y、2=Z；配置映射后的 X 朝前、Y 横向、Z 朝上。
  * 默认输入单位 g；若调用方传 m/s^2，把 ACCEL_UNITS_PER_G 设为 9.80665。
@@ -94,7 +99,7 @@
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
-#define OBSTACLE_CLEAR_DISTANCE_MM       300
+#define OBSTACLE_CLEAR_DISTANCE_MM       350
 #define OBSTACLE_TURN_ANGLE_DEG          80
 #define OBSTACLE_REVERSE_SPEED_MM_S      240
 #define OBSTACLE_TURN_SPEED_MM_S         220
@@ -115,9 +120,9 @@
 #define HEADING_DEADBAND_DEG             1
 #define HEADING_MAX_CORRECTION_MM_S      40
 
-/* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
+/* 【悬崖避让】弧线倒车与原地转向分别由 CLIFF_BACKUP_DISTANCE_MM / CLIFF_TURN_ANGLE_DEG 配置。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
-#define CLIFF_TURN_ANGLE_DEG              30
+#define CLIFF_TURN_ANGLE_DEG             20
 #define CLIFF_BACKUP_FAST_MM_S           160
 #define CLIFF_BACKUP_SLOW_MM_S           100
 #define CLIFF_TURN_SPEED_MM_S            160
@@ -133,6 +138,12 @@
 #endif
 #if FINISH_DISTANCE_MM <= 0
 #error Finish_distance_must_be_positive
+#endif
+#if FINISH_DESCENT_MIN_DISTANCE_MM <= 0
+#error Descent_confirmation_distance_must_be_positive
+#endif
+#if FINISH_UP_REQUIRED <= 0 || FINISH_UP_REQUIRED > FINISH_VOTE_SAMPLE_COUNT || FINISH_DOWN_REQUIRED <= 0 || FINISH_DOWN_REQUIRED > FINISH_VOTE_SAMPLE_COUNT || FINISH_LEVEL_REQUIRED <= 0 || FINISH_LEVEL_REQUIRED > FINISH_VOTE_SAMPLE_COUNT
+#error Invalid_finish_vote_parameters
 #endif
 #if ACCEL_FORWARD_AXIS < 0 || ACCEL_FORWARD_AXIS > 2 || ACCEL_SIDE_AXIS < 0 || ACCEL_SIDE_AXIS > 2 || ACCEL_VERTICAL_AXIS < 0 || ACCEL_VERTICAL_AXIS > 2
 #error Invalid_accelerometer_axis
@@ -161,7 +172,7 @@ typedef enum {
 typedef enum { SAMPLE_UNKNOWN = 0, SAMPLE_UPHILL, SAMPLE_DOWNHILL, SAMPLE_LEVEL } slopeSample_t;
 
 typedef enum {
-    FINISH_WAIT_UPHILL = 0, FINISH_WAIT_DOWNHILL, FINISH_WAIT_GROUND,
+    FINISH_WAIT_UPHILL = 0, FINISH_WAIT_TOP, FINISH_WAIT_DOWNHILL, FINISH_WAIT_GROUND,
     FINISH_COUNT_DISTANCE, FINISH_LOCKED
 } finishStage_t;
 
@@ -200,12 +211,14 @@ typedef struct {
     finishStage_t finishStage;
     unsigned char finishSamples[FINISH_VOTE_SAMPLE_COUNT];
     int finishIndex, finishCount;
+    int32_t descentDistance, descentLastDistance;
+    bool previousDescentSample;
 } navigation_t;
 
 /* 【只读调试快照】在 Eclipse Expressions 中展开 kobukiDebug。
  * phase: 0接近、1上坡、2坡顶、3下坡、4终点直行、5停车。
  * motion: 0直行、1碰撞倒车、2转向、3绕行、4回正、5悬崖倒车、6悬崖转向。
- * finishStage: 0等上坡、1等下坡、2下坡已锁存/等平地、3计距、4停车锁止。
+ * finishStage: 0等上坡、1等坡顶、2等实际下坡、3下坡已锁存/等平地、4计距、5停车锁止。
  * floorReferenceValid 为 false 时首次启动保持停车；pitchDeg/tiltDeg 是相对启动地面的角度。
  * invalidAccelSamples/stillDistanceSamples 是连续调用次数，不是毫秒或超时。
  */
@@ -224,6 +237,7 @@ typedef struct {
     bool floorReferenceValid, descentConfirmed;
     int floorSamples, finishStage, finishVotes, finishSampleCount;
     double floorX, floorY, floorZ;
+    int32_t descentDistance;
 } kobukiDebug_t;
 volatile kobukiDebug_t kobukiDebug;
 
@@ -344,6 +358,10 @@ static accelerometer_t relativeToFloor(const navigation_t * const nav, const acc
 static void resetFinishVotes(navigation_t * const nav)
 {
     nav->finishIndex = nav->finishCount = 0;
+    if (nav->finishStage == FINISH_WAIT_DOWNHILL) {
+        nav->descentDistance = 0;
+        nav->previousDescentSample = false;
+    }
 }
 
 /* 成对缩放保留差速比例，例如上坡 400/300 在上限 200 时输出 200/150。 */
@@ -445,7 +463,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
 static void updateRoute(navigation_t * const nav, const accelerometer_t accel)
 {
     int i;
-    int up = 0, down = 0, level = 0;
+    int up = 0, level = 0;
     routePhase_t next = nav->phase;
     nav->pitchSamples[nav->pitchIndex] = classifySlope(accel);
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
@@ -453,7 +471,6 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel)
     if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
     for (i = 0; i < PITCH_WINDOW_SAMPLE_COUNT; i++) {
         if (nav->pitchSamples[i] == SAMPLE_UPHILL) { up++; }
-        else if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { down++; }
         else if (nav->pitchSamples[i] == SAMPLE_LEVEL) { level++; }
     }
     switch (nav->phase) {
@@ -461,14 +478,14 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel)
         if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
         break;
     case CLIMB_RAMP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
-        else if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
+        /* 上坡末端负读数可能是减速；先经过坡顶确认，不能直接跳到下坡。 */
+        if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
         break;
     case DRIVE_ACROSS_TOP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
+        /* 下坡必须同时满足负坡度投票和前进距离，由 updateFinish 统一确认。 */
         break;
     case DESCEND_RAMP:
-        /* 落地由独立停车流程负责，不再把它绑定到本状态的 8 中 7 平地票。 */
+        /* 落地由独立停车流程负责，不绑定主路线的平地投票门槛。 */
         break;
     default:
         break;
@@ -481,16 +498,18 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel)
     }
 }
 
-/* 【独立停车流程】先有上坡证据，再锁存下坡，最后确认回到启动地面。
- * 逐次原始读数投票：上下坡 8 中 7，容许异常出现在窗口任意位置。
- * 落地 8 中 6，且最新一次必须是平地，避免在刚发生的振动中开始终点计距。
- * -3.5 度用于捕获主路线 -5 度门槛漏掉的浅下坡；落地门槛 3 度，与下坡不重叠。
- * 悬崖/倒车/转向/暂停不采停车票；下坡锁存保留，恢复后收集新窗口。
+/* 【独立停车流程】上坡 -> 坡顶 -> 实际下坡 -> 终点平地，禁止上坡接平地直接停车。
+ * 各阶段按 FINISH_VOTE_SAMPLE_COUNT / 对应 REQUIRED 投票；坡顶和终点要求最新一票为平地。
+ * 只有坡顶之后、负坡度满足投票且有效下坡里程达到门槛，才锁存“已下坡”。
+ * 回到平地/正坡取消未确认候选；无效读数间不跨区间累计里程。
+ * 悬崖/倒车/转向/暂停清空未确认候选；已经确认的下坡仍保留。
  */
-static void updateFinish(navigation_t * const nav, const int32_t angle, const bool cliff)
+static void updateFinish(navigation_t * const nav, const int32_t angle,
+    const int32_t distance, const bool cliff)
 {
     unsigned char evidence = 0;
     int i, votes = 0, required;
+    int64_t delta;
     if (nav->finishStage >= FINISH_COUNT_DISTANCE) { return; }
     if (cliff || (nav->motion != ROUTE_DRIVE && nav->motion != OBSTACLE_CLEAR)) {
         resetFinishVotes(nav);
@@ -505,17 +524,48 @@ static void updateFinish(navigation_t * const nav, const int32_t angle, const bo
         }
         else { evidence = kobukiDebug.tiltDeg <= FINISH_LEVEL_TILT_DEG; }
     }
+    if (nav->finishStage == FINISH_WAIT_DOWNHILL) {
+        if (kobukiDebug.accelValid && (kobukiDebug.tiltDeg <= FINISH_LEVEL_TILT_DEG
+            || kobukiDebug.pitchDeg >= 0.0)) {
+            resetFinishVotes(nav);
+            return;
+        }
+        if (evidence && nav->previousDescentSample) {
+            delta = forwardDistanceDelta(distance, nav->descentLastDistance);
+            if (delta < 0) { resetFinishVotes(nav); }
+            else if (delta > 0) {
+                if (delta >= FINISH_DESCENT_MIN_DISTANCE_MM - nav->descentDistance) {
+                    nav->descentDistance = FINISH_DESCENT_MIN_DISTANCE_MM;
+                }
+                else { nav->descentDistance += (int32_t)delta; }
+            }
+        }
+        nav->previousDescentSample = evidence != 0;
+        nav->descentLastDistance = distance;
+    }
     nav->finishSamples[nav->finishIndex] = evidence;
     nav->finishIndex = (nav->finishIndex + 1) % FINISH_VOTE_SAMPLE_COUNT;
     if (nav->finishCount < FINISH_VOTE_SAMPLE_COUNT) { nav->finishCount++; }
     if (nav->finishCount < FINISH_VOTE_SAMPLE_COUNT
-        || (nav->finishStage == FINISH_WAIT_GROUND && !evidence)) { return; }
+        || ((nav->finishStage == FINISH_WAIT_TOP || nav->finishStage == FINISH_WAIT_GROUND) && !evidence)) { return; }
     for (i = 0; i < nav->finishCount; i++) { votes += nav->finishSamples[i]; }
+    if (nav->finishStage == FINISH_WAIT_DOWNHILL && votes == 0) {
+        resetFinishVotes(nav);
+        return;
+    }
     required = nav->finishStage == FINISH_WAIT_UPHILL ? FINISH_UP_REQUIRED
         : (nav->finishStage == FINISH_WAIT_DOWNHILL ? FINISH_DOWN_REQUIRED : FINISH_LEVEL_REQUIRED);
     if (votes < required) { return; }
+    if (nav->finishStage == FINISH_WAIT_DOWNHILL
+        && (!evidence || nav->descentDistance < FINISH_DESCENT_MIN_DISTANCE_MM)) { return; }
     if (nav->finishStage == FINISH_WAIT_UPHILL) {
+        nav->finishStage = FINISH_WAIT_TOP;
+    }
+    else if (nav->finishStage == FINISH_WAIT_TOP) {
         nav->finishStage = FINISH_WAIT_DOWNHILL;
+        nav->phase = DRIVE_ACROSS_TOP;
+        nav->motion = ROUTE_DRIVE;
+        resetVotes(nav);
     }
     else if (nav->finishStage == FINISH_WAIT_DOWNHILL) {
         nav->finishStage = FINISH_WAIT_GROUND;
@@ -535,8 +585,8 @@ static void updateFinish(navigation_t * const nav, const int32_t angle, const bo
     resetFinishVotes(nav);
 }
 
-/* 【Y 差速纠偏】五次中三次同方向超过 ±0.006 g 时进入；
- * 两个方向都不足三票时退出，反方向达到三票时直接切换。
+/* 【Y 差速纠偏】同方向达到 Y_ALIGNMENT_THRESHOLD_G 且满足 Y_REQUIRED_SAMPLE_COUNT 票时进入；
+ * 两方向均不足票数时退出，反方向满足票数时切换；同票时沿用正方向优先规则。
  * 进入、退出共用同一个窗口；只覆盖正常上、下坡的直行轮速。
  */
 static int updateY(navigation_t * const nav, const double y)
@@ -695,6 +745,7 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     kobukiDebug.floorY = nav->floorNormal[1];
     kobukiDebug.floorZ = nav->floorNormal[2];
     kobukiDebug.finishStage = nav->finishStage;
+    kobukiDebug.descentDistance = nav->descentDistance;
     kobukiDebug.descentConfirmed = nav->finishStage >= FINISH_WAIT_GROUND;
     kobukiDebug.finishSampleCount = nav->finishCount;
     kobukiDebug.finishVotes = 0;
@@ -813,7 +864,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         && nav.phase != FINISH_STRAIGHT) {
         updateRoute(&nav, calibratedAccel);
     }
-    updateFinish(&nav, netAngle, cliff);
+    updateFinish(&nav, netAngle, netDistance, cliff);
     if (nav.motion == CLIFF_BACKUP
         && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
         nav.maneuverAngle = netAngle;
