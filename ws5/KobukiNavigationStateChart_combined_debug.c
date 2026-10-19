@@ -8,7 +8,7 @@
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
- * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
+ * 轮速在纠偏后统一缩放为此前的 70%；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地直接停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
  * 坡道悬崖避让保留坡度投票，动作期间暂停采样，结束后接着判断下坡/落地。
@@ -74,6 +74,7 @@
 #define CLIFF_BACKUP_FAST_MM_S           160
 #define CLIFF_BACKUP_SLOW_MM_S           100
 #define CLIFF_TURN_SPEED_MM_S            160
+#define WHEEL_SPEED_SCALE                0.70 /* 所有动作最终轮速统一降至 70%，保留差速比例。 */
 #ifndef WHEEL_SPEED_TRIM
 #define WHEEL_SPEED_TRIM                 0.00 /* 负值补左轮，正值补右轮 */
 #endif
@@ -150,7 +151,7 @@ static int16_t limitSpeed(const int16_t speed, const int16_t maximum)
 static int16_t trimWheelSpeed(const int16_t speed, const double boost,
     const int16_t maximum)
 {
-    double magnitude = floor(fabs((double)speed) * (1.0 + boost) + 0.5);
+    double magnitude = floor(fabs((double)speed) * (1.0 + boost) * WHEEL_SPEED_SCALE + 0.5);
     (void)maximum;
     return (int16_t)(speed < 0 ? -magnitude : magnitude);
 }
