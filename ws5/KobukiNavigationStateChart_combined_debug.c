@@ -8,7 +8,8 @@
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
- * 轮速在纠偏后统一缩放为此前的 70%；加速度单位 g，距离 mm，轮速 mm/s。
+ * 各阶段基础轮速和纠偏速度参数直接设为原来的约 70%；输出端不再统一缩放。
+ * 加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地直接停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
  * 坡道悬崖避让保留坡度投票，动作期间暂停采样，结束后接着判断下坡/落地。
@@ -31,50 +32,49 @@
 #define Y_CORRECTION_MAX_DURATION_MS     2000  /* 持续纠偏最大时间：2秒超时强制退出 */
 #define Y_CORRECTION_COOLDOWN_MS         1000  /* 超时退出后的平稳直行冷却时间 */
 
-/* 【路线轮速】先按阶段选择，再应用 Y 纠偏和固定轮速补偿。 */
-#define APPROACH_SPEED_MM_S              400
-#define CLIMB_SPEED_MM_S                 400
-#define TOP_SPEED_MM_S                   300
-#define DESCEND_SPEED_MM_S               200
-#define FINISH_SPEED_MM_S                400
+/* 【路线轮速】基础值已降至原来的 70%，先选阶段，再应用纠偏和固定补偿。 */
+#define APPROACH_SPEED_MM_S              280
+#define CLIMB_SPEED_MM_S                 280
+#define TOP_SPEED_MM_S                   210
+#define DESCEND_SPEED_MM_S               140
+#define FINISH_SPEED_MM_S                280
 #ifndef FINISH_DISTANCE_MM
 #define FINISH_DISTANCE_MM               200  /* 下坡确认平地后，正常直行的距离 */
 #endif
-#define UPHILL_ALIGN_OUTER_SPEED_MM_S    400
-#define UPHILL_ALIGN_INNER_SPEED_MM_S    300
-#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  200
-#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  150
+#define UPHILL_ALIGN_OUTER_SPEED_MM_S    280
+#define UPHILL_ALIGN_INNER_SPEED_MM_S    210
+#define DOWNHILL_ALIGN_OUTER_SPEED_MM_S  140
+#define DOWNHILL_ALIGN_INNER_SPEED_MM_S  105
 
 /* 【地面碰撞避障】左撞右转、右撞左转、中央/双侧碰撞交替转向。 */
 #define OBSTACLE_BACKUP_DISTANCE_MM      120
 #define OBSTACLE_CLEAR_DISTANCE_MM       300
 #define OBSTACLE_TURN_ANGLE_DEG          80
-#define OBSTACLE_REVERSE_SPEED_MM_S      240
-#define OBSTACLE_TURN_SPEED_MM_S         220
+#define OBSTACLE_REVERSE_SPEED_MM_S      168
+#define OBSTACLE_TURN_SPEED_MM_S         154
 #define HEADING_TOLERANCE_DEG            5
-#define REORIENT_MIN_SPEED_MM_S          40
-#define REORIENT_GAIN_MM_S_PER_DEG       6
+#define REORIENT_MIN_SPEED_MM_S          28
+#define REORIENT_GAIN_MM_S_PER_DEG       4.2
 
-/* 【前半段航向保持】移植参考文件的阻尼、积分和每周期修正限幅参数。 */
+/* 【前半段航向保持】速度相关增益和限幅同步降至 70%，角度与滤波参数保留。 */
 #ifndef HEADING_ANGLE_SIGN
 #define HEADING_ANGLE_SIGN               1
 #endif
-#define HEADING_KP_MM_S_PER_DEG           2.5
-#define HEADING_KD_MM_S_PER_DEG_STEP      8.0
-#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.015
-#define HEADING_MAX_INTEGRAL_MM_S        12.0
+#define HEADING_KP_MM_S_PER_DEG           1.75
+#define HEADING_KD_MM_S_PER_DEG_STEP      5.6
+#define HEADING_KI_MM_S_PER_DEG_SAMPLE    0.0105
+#define HEADING_MAX_INTEGRAL_MM_S        8.4
 #define HEADING_YAW_RATE_FILTER_ALPHA    0.25
-#define HEADING_CORRECTION_STEP_MM_S     3.0
+#define HEADING_CORRECTION_STEP_MM_S     2.1
 #define HEADING_DEADBAND_DEG             1
-#define HEADING_MAX_CORRECTION_MM_S      40
+#define HEADING_MAX_CORRECTION_MM_S      28
 
 /* 【悬崖避让】保留 WS5 的弧线倒车 60 mm、原地转向 30 度。 */
 #define CLIFF_BACKUP_DISTANCE_MM         60
 #define CLIFF_TURN_ANGLE_DEG              30
-#define CLIFF_BACKUP_FAST_MM_S           160
-#define CLIFF_BACKUP_SLOW_MM_S           100
-#define CLIFF_TURN_SPEED_MM_S            160
-#define WHEEL_SPEED_SCALE                0.70 /* 所有动作最终轮速统一降至 70%，保留差速比例。 */
+#define CLIFF_BACKUP_FAST_MM_S           112
+#define CLIFF_BACKUP_SLOW_MM_S           70
+#define CLIFF_TURN_SPEED_MM_S            112
 #ifndef WHEEL_SPEED_TRIM
 #define WHEEL_SPEED_TRIM                 0.00 /* 负值补左轮，正值补右轮 */
 #endif
@@ -151,7 +151,7 @@ static int16_t limitSpeed(const int16_t speed, const int16_t maximum)
 static int16_t trimWheelSpeed(const int16_t speed, const double boost,
     const int16_t maximum)
 {
-    double magnitude = floor(fabs((double)speed) * (1.0 + boost) * WHEEL_SPEED_SCALE + 0.5);
+    double magnitude = floor(fabs((double)speed) * (1.0 + boost) + 0.5);
     (void)maximum;
     return (int16_t)(speed < 0 ? -magnitude : magnitude);
 }
