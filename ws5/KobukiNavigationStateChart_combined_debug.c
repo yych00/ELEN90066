@@ -12,6 +12,7 @@
  * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
  * 流程：接近坡道 -> 上坡 -> 坡顶/直接下坡 -> 下坡 -> 平地定距 -> 停车锁止。
  * 坡上不响应 bumper，仅做悬崖检测和坡度纠偏；地面才启用碰撞避障。
+ * 坡道悬崖避让保留坡度投票，动作期间暂停采样，结束后接着判断下坡/落地。
  * 本文件替换工程中的原状态机源文件，不与其他同名接口实现一起编译。
  */
 #include "KobukiNavigationStateChart.h"
@@ -176,7 +177,7 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 暂停、避让、路线切换后清除入口确认，重新收满坡度和 Y 窗口。 */
+/* 暂停、地面碰撞、路线切换后重新收满坡度和 Y 窗口。 */
 static void resetVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
@@ -199,6 +200,21 @@ static void resetRun(navigation_t * const nav, const int32_t distance,
 static bool onGround(const routePhase_t phase)
 {
     return phase == APPROACH_RAMP || phase == FINISH_STRAIGHT;
+}
+
+/* 【悬崖窗口】坡道上保留坡度票和写入位置，避免下坡/落地确认反复重来。
+ * 入口确认、Y 投票与纠偏计时均清除；地面仍丢弃未确认的坡度证据。
+ * 悬崖倒车和转向期间不调用 updateRoute，不会写入新的坡度票。
+ */
+static void resetCliffVotes(navigation_t * const nav)
+{
+    nav->confirmingUphill = false;
+    nav->yIndex = nav->yCount = 0;
+    nav->yCorrectionDurationMs = 0;
+    nav->yCooldownMs = 0;
+    if (onGround(nav->phase)) {
+        nav->pitchIndex = nav->pitchCount = 0;
+    }
 }
 
 /* 【坡度判断】横着处于斜坡不能算平地；过小/过大的合加速度不投有效票。 */
@@ -316,7 +332,7 @@ static void beginCliff(navigation_t * const nav, const KobukiSensors_t sensors,
     nav->turnRight = sensors.cliffLeft || sensors.cliffCenter;
     nav->maneuverDistance = distance;
     nav->motion = CLIFF_BACKUP;
-    resetVotes(nav);
+    resetCliffVotes(nav);
 }
 
 /* 【前半段直行/绕行纠偏】正常直行锁定路线航向，绕行锁定转向完成时的航向。
@@ -518,7 +534,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else {
             nav.motion = ROUTE_DRIVE;
             nav.routeHeading = netAngle; /* 不回到刚才朝向悬崖的旧航向 */
-            resetVotes(&nav);
+            resetCliffVotes(&nav);
         }
     }
 
