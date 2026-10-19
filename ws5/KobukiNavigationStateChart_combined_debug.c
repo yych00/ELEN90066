@@ -5,7 +5,8 @@
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
  * 下坡标志锁存后独立检测落地：前后俯仰在 ±4.8° 内，最近 8 次中 6 次确认。
  * 落地窗口在暂停和悬崖动作期间冻结，只有 B1 重置或首次确认下坡时清空。
- * 坡度采用 8 中 6 投票，保留 Y 纠偏与轮速；combined.c 保持原文件。
+ * 上下坡按 cliff_pitch.c 的前后俯仰与阶段逻辑处理，投票保留 8 中 6。
+ * Y 按 5 中 3 持续纠偏，无超时冷却；保留当前轮速及独立落地停车。
  * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
@@ -25,7 +26,6 @@
 /* 【坡度判断】原始读数投票，不平均、不要求连续满足。 */
 #define RAD_TO_DEG                       57.29577951308232
 #define PITCH_THRESHOLD_DEG              5.0
-#define LEVEL_TILT_DEG                   4.5  /* 整体倾角：同时约束前后和横向 */
 #define LANDING_PITCH_DEG                4.8  /* 下坡后的落地俯仰容差，小于 5° 坡度阈值。 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      6
@@ -180,7 +180,7 @@ static bool backupDistanceReached(const int32_t current, const int32_t start,
     return travelled >= required;
 }
 
-/* 暂停、地面碰撞、路线切换后重新收满坡度窗口；参考 cliff_pitch.c 保留 Y 滤波滑动窗口。 */
+/* 路线切换清空坡度窗口，保留正常行驶中的 Y 投票；落地窗口独立保存。 */
 static void resetVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
@@ -202,36 +202,29 @@ static bool onGround(const routePhase_t phase)
     return phase == APPROACH_RAMP || phase == FINISH_STRAIGHT;
 }
 
-/* 【悬崖窗口】坡道上保留坡度票和写入位置，避免下坡/落地确认反复重来。
- * 地面仍丢弃未确认的坡度证据。参考 cliff_pitch.c，悬崖动作不打乱 Y 滑动窗口。
- * 悬崖倒车和转向期间不调用 updateRoute，不会写入新的坡度票。
- */
+/* 悬崖动作冻结坡道与落地票；清除 Y 票，避免避让前的方向影响恢复行驶。 */
 static void resetCliffVotes(navigation_t * const nav)
 {
     nav->confirmingUphill = false;
+    nav->yIndex = nav->yCount = 0;
     if (onGround(nav->phase)) {
         nav->pitchIndex = nav->pitchCount = 0;
     }
 }
 
-/* 【坡度判断】通常按整体倾角判平地；已确认下坡后仅按前后俯仰判落地。
- * 过小/过大的合加速度不投有效票。落地判断不受 Y 轴倾角直接限制。
+/* 【坡度判断】参考 cliff_pitch.c：俯仰 >=5° 上坡、<=-5° 下坡，中间平地。
+ * 保留合加速度有效性检查；独立落地检测使用更严格的 ±4.8° 容差。
  */
 static slopeSample_t classifySlope(const accelerometer_t accel, const bool landingCheck)
 {
     double lateral = sqrt(accel.y * accel.y + accel.z * accel.z);
     double magnitude = sqrt(accel.x * accel.x + lateral * lateral);
     double pitch;
-    double tilt;
     if (!(magnitude >= 0.5 && magnitude <= 1.5)) { return SAMPLE_UNKNOWN; }
     pitch = atan2(accel.x, lateral) * RAD_TO_DEG;
-    tilt = atan2(sqrt(accel.x * accel.x + accel.y * accel.y),
-        fabs(accel.z)) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
-    if (landingCheck ? fabs(pitch) <= LANDING_PITCH_DEG : tilt <= LEVEL_TILT_DEG) {
-        return SAMPLE_LEVEL;
-    }
+    if (!landingCheck || fabs(pitch) <= LANDING_PITCH_DEG) { return SAMPLE_LEVEL; }
     return SAMPLE_UNKNOWN;
 }
 
@@ -251,22 +244,23 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         else if (nav->pitchSamples[i] == SAMPLE_DOWNHILL) { down++; }
         else if (nav->pitchSamples[i] == SAMPLE_LEVEL) { level++; }
     }
-    switch (nav->phase) {
-    case APPROACH_RAMP:
-        if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
-        break;
-    case CLIMB_RAMP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
-        else if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
-        break;
-    case DRIVE_ACROSS_TOP:
-        if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
-        break;
-    case DESCEND_RAMP:
-        /* 落地停车由 downhillFlag 门控的独立窗口处理。 */
-        break;
-    default:
-        break;
+    /* 参考文件优先识别下坡，不要求此前一定成功经过上坡/坡顶阶段。 */
+    if (down >= PITCH_REQUIRED_SAMPLE_COUNT && nav->phase != DESCEND_RAMP
+        && nav->phase != FINISH_STRAIGHT && nav->phase != FINISHED) {
+        next = DESCEND_RAMP;
+    }
+    else {
+        switch (nav->phase) {
+        case APPROACH_RAMP:
+            if (up >= PITCH_REQUIRED_SAMPLE_COUNT) { next = CLIMB_RAMP; }
+            break;
+        case CLIMB_RAMP:
+            if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DRIVE_ACROSS_TOP; }
+            break;
+        default:
+            /* 坡顶等候下坡；下坡后的停车由独立落地窗口处理。 */
+            break;
+        }
     }
     if (next != nav->phase) {
         nav->phase = next;
@@ -344,6 +338,7 @@ static void beginObstacle(navigation_t * const nav, const KobukiSensors_t sensor
     nav->maneuverDistance = distance;
     nav->motion = OBSTACLE_BACKUP;
     resetVotes(nav);
+    nav->yIndex = nav->yCount = 0;
 }
 
 /* 【悬崖避让】优先于地面避障；取消被打断的避障动作，但保留路线阶段。 */
@@ -492,7 +487,11 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     /* 【B0 按钮】按下立即暂停；释放、再次按下并释放后才恢复。 */
     switch (nav.button) {
     case RUNNING:
-        if (sensors.buttons.B0) { nav.button = WAIT_PAUSE_RELEASE; resetVotes(&nav); }
+        if (sensors.buttons.B0) {
+            nav.button = WAIT_PAUSE_RELEASE;
+            resetVotes(&nav);
+            nav.yIndex = nav.yCount = 0;
+        }
         break;
     case WAIT_PAUSE_RELEASE:
         if (!sensors.buttons.B0) { nav.button = WAIT_START_PRESS; }
@@ -520,6 +519,12 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     /* 【悬崖优先】检测当次就倒车；不采集避让中的坡度读数。 */
     if (cliff && nav.motion != CLIFF_BACKUP && nav.motion != CLIFF_TURN) {
         beginCliff(&nav, sensors, netDistance);
+    }
+    /* 正常行驶时每周期采一次 Y，坡顶也更新；暂停、倒车和转向不采样。
+     * 在路线切换前采样，进入上/下坡时可立即使用已有窗口。
+     */
+    if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)) {
+        correction = updateY(&nav, accelAxes.y);
     }
     /* 绕障直行也可能驶上坡道；坡度确认优先于本周期的碰撞倒车。 */
     if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
@@ -618,39 +623,20 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         else if (nav.phase == DESCEND_RAMP) { speed = DESCEND_SPEED_MM_S; }
         else if (nav.phase == FINISH_STRAIGHT) { speed = FINISH_SPEED_MM_S; }
         left = right = limitSpeed(speed, maxWheelSpeed);
-        /* 【坡度控制动作：Y 差速纠偏】完全参考 cliff_pitch.c
-         * 在基础轮速之后执行；最近 5 次 Y 中至少 3 次同方向超过阈值就纠偏。
-         * 无超时与冷却限制，车身回正自然恢复直行。下坡时纠偏方向相反。
+        /* 参考 cliff_pitch.c：Y 五次中三次同向超阈值就持续差速。
+         * 不足三票则保留本阶段等轮速；下坡的纠偏方向与上坡相反。
          */
-        if (nav.phase == CLIMB_RAMP) {
-            correction = updateY(&nav, accelAxes.y);
-            if (correction > 0) {
-                /* 上坡 Y 正向：右转（左轮外侧快，右轮内侧慢） */
-                left = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-                right = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-            }
-            else if (correction < 0) {
-                /* 上坡 Y 负向：左转（左轮内侧慢，右轮外侧快） */
-                left = limitSpeed(UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-                right = limitSpeed(UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-            }
+        if (nav.phase == CLIMB_RAMP && correction != 0) {
+            left = limitSpeed(correction > 0 ? UPHILL_ALIGN_OUTER_SPEED_MM_S
+                : UPHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
+            right = limitSpeed(correction > 0 ? UPHILL_ALIGN_INNER_SPEED_MM_S
+                : UPHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
         }
-        else if (nav.phase == DESCEND_RAMP) {
-            correction = updateY(&nav, accelAxes.y);
-            if (correction > 0) {
-                /* 下坡 Y 正向：左转（左轮内侧慢，右轮外侧快，与上坡相反） */
-                left = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-                right = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-            }
-            else if (correction < 0) {
-                /* 下坡 Y 负向：右转（左轮外侧快，右轮内侧慢，与上坡相反） */
-                left = limitSpeed(DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
-                right = limitSpeed(DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
-            }
-        }
-        else if (nav.phase == APPROACH_RAMP) {
-            /* 接近坡道平地行驶时持续滑动更新 Y 读数，确保切入上坡时窗口已就绪 */
-            (void)updateY(&nav, accelAxes.y);
+        else if (nav.phase == DESCEND_RAMP && correction != 0) {
+            left = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_INNER_SPEED_MM_S
+                : DOWNHILL_ALIGN_OUTER_SPEED_MM_S, maxWheelSpeed);
+            right = limitSpeed(correction > 0 ? DOWNHILL_ALIGN_OUTER_SPEED_MM_S
+                : DOWNHILL_ALIGN_INNER_SPEED_MM_S, maxWheelSpeed);
         }
         break;
     case OBSTACLE_BACKUP:
