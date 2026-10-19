@@ -1,10 +1,10 @@
 /*
- * WS5 + 地面避障完整控制器：基于版本 1.0 修复上坡入口与停车标志。
+ * WS5 + 地面避障完整控制器：版本 1.1。
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
  * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地置 landingFlag。
  * landingFlag 置位后才按原流程正常直行 200 mm，达到距离输出零轮速并锁止。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
- * 保留 1.0 的坡度阈值、8 中 7 投票、Y 纠偏与轮速；combined.c 保持原文件。
+ * 保留坡度阈值、8 中 7 投票、Y 纠偏与轮速；combined.c 保持原文件。
  * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
  * 碰撞同时读到上坡时先停车，重新收满 8 次读数：7 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
@@ -25,7 +25,7 @@
 #define LEVEL_TILT_DEG                   3.0  /* 整体倾角：同时约束前后和横向 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
 #define PITCH_REQUIRED_SAMPLE_COUNT      7
-#define Y_ALIGNMENT_THRESHOLD_G         0.01
+#define Y_ALIGNMENT_THRESHOLD_G          0.005
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
 
@@ -135,19 +135,18 @@ typedef struct {
     int yCount;
 } navigation_t;
 
-/* 【通用控制】所有轮速均受调用方 maxWheelSpeed 限制。 */
+/* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
 static int16_t limitSpeed(const int16_t speed, const int16_t maximum)
 {
-    if (maximum <= 0) { return 0; }
-    return speed < maximum ? speed : maximum;
+    (void)maximum;
+    return speed;
 }
 
 static int16_t trimWheelSpeed(const int16_t speed, const double boost,
     const int16_t maximum)
 {
     double magnitude = floor(fabs((double)speed) * (1.0 + boost) + 0.5);
-    if (maximum <= 0) { return 0; }
-    if (magnitude > maximum) { magnitude = maximum; }
+    (void)maximum;
     return (int16_t)(speed < 0 ? -magnitude : magnitude);
 }
 
@@ -314,7 +313,7 @@ static void beginCliff(navigation_t * const nav, const KobukiSensors_t sensors,
 }
 
 /* 【前半段直行/绕行纠偏】正常直行锁定路线航向，绕行锁定转向完成时的航向。
- * 保留配置的基础速度；达到调用方轮速上限时，两轮同时减去超出量，保持差速。
+ * 保留配置的基础速度；已移除调用方轮速上限截断，保持两轮差速纠偏。
  * 和参考文件一样，KD 与积分按调用次数计算，调用周期变化会影响实际纠偏效果。
  */
 static void maintainApproachHeading(navigation_t * const nav, const int32_t angle,
@@ -322,7 +321,8 @@ static void maintainApproachHeading(navigation_t * const nav, const int32_t angl
 {
     int32_t target;
     double error, yawStep = 0.0, correction, correctionLimit, baseSpeed;
-    double requestedLeft, requestedRight, excess;
+    double requestedLeft, requestedRight;
+    (void)maximum;
     if (nav->phase != APPROACH_RAMP || (nav->motion != ROUTE_DRIVE
             && nav->motion != OBSTACLE_CLEAR)) {
         nav->headingControlActive = false;
@@ -373,8 +373,6 @@ static void maintainApproachHeading(navigation_t * const nav, const int32_t angl
     nav->previousCorrection = correction;
     requestedLeft = baseSpeed + correction;
     requestedRight = baseSpeed - correction;
-    excess = (requestedLeft > requestedRight ? requestedLeft : requestedRight) - maximum;
-    if (excess > 0.0) { requestedLeft -= excess; requestedRight -= excess; }
     if (requestedLeft < 0.0) { requestedLeft = 0.0; }
     if (requestedRight < 0.0) { requestedRight = 0.0; }
     *left = (int16_t)floor(requestedLeft + 0.5);
