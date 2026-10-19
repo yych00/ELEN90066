@@ -8,6 +8,8 @@ $controller = Join-Path $PSScriptRoot '..\KobukiNavigationStateChart_combined_de
 $testSource = Join-Path $PSScriptRoot 'test_combined_debug_controller.c'
 $testExecutable = Join-Path ([System.IO.Path]::GetTempPath()) ('kobuki-debug-' + [guid]::NewGuid().ToString('N') + '.exe')
 $scenarios = @(
+    'ramp_entry_persistent_bumper', 'ramp_entry_oblique_clear', 'ramp_entry_flat_collision_impulse',
+    'ramp_entry_lateral_bumper', 'ramp_entry_pause_confirmation', 'ramp_entry_cliff_priority', 'ramp_entry_no_premature_top',
     'route_stop', 'no_flat_top', 'vote_tolerance', 'bumper_on_slope',
     'cross_slope', 'invalid_acceleration', 'y_votes', 'pause_votes',
     'finish_pause', 'finish_obstacle', 'finish_cliff', 'persistent_cliff',

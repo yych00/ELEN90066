@@ -51,6 +51,62 @@ static void reachTop(void)
     assert(!kobukiDebug.descentConfirmed);
 }
 
+static int rampEntryScenario(const char * const name)
+{
+    int i;
+    if (strcmp(name, "ramp_entry_persistent_bumper") == 0) {
+        start(0); terrain(15, 0); input.bumps_wheelDrops.bumpLeft = true;
+        for (i = 1; i < PITCH_WINDOW_SAMPLE_COUNT; i++) { tick(0, 0); expect(0, 0); }
+        tick(0, 0); expect(400, 400);
+        assert(kobukiDebug.phase == CLIMB_RAMP && kobukiDebug.motion == ROUTE_DRIVE);
+        samples(8, 0, 0); expect(400, 400);
+    }
+    else if (strcmp(name, "ramp_entry_oblique_clear") == 0) {
+        start(0); input.bumps_wheelDrops.bumpLeft = true; tick(0, 0);
+        input.bumps_wheelDrops.bumpLeft = false; tick(-120, 0); tick(-120, -80);
+        acceleration.x = sin(15 / RAD_TO_DEG) * cos(80 / RAD_TO_DEG);
+        acceleration.y = -sin(15 / RAD_TO_DEG) * sin(80 / RAD_TO_DEG);
+        acceleration.z = cos(15 / RAD_TO_DEG);
+        input.bumps_wheelDrops.bumpCenter = true;
+        samples(PITCH_WINDOW_SAMPLE_COUNT, -120, -80);
+        assert(kobukiDebug.phase == CLIMB_RAMP && kobukiDebug.motion == ROUTE_DRIVE);
+        samples(Y_FILTER_SAMPLE_COUNT, -120, -80); expect(300, 400);
+    }
+    else if (strcmp(name, "ramp_entry_flat_collision_impulse") == 0) {
+        start(0); acceleration.x = 0.1; acceleration.y = 0; acceleration.z = 1;
+        input.bumps_wheelDrops.bumpLeft = true; tick(0, 0); expect(0, 0);
+        terrain(0, 0); samples(PITCH_WINDOW_SAMPLE_COUNT - 1, 0, 0); expect(-240, -240);
+        assert(kobukiDebug.phase == APPROACH_RAMP);
+    }
+    else if (strcmp(name, "ramp_entry_lateral_bumper") == 0) {
+        start(0); terrain(0, 0.25); input.bumps_wheelDrops.bumpLeft = true;
+        tick(0, 0); expect(-240, -240);
+        assert(kobukiDebug.phase == APPROACH_RAMP);
+    }
+    else if (strcmp(name, "ramp_entry_pause_confirmation") == 0) {
+        start(0); terrain(15, 0); input.bumps_wheelDrops.bumpLeft = true;
+        samples(3, 0, 0); expect(0, 0); pauseAt(0, 0); resumeAt(0, 0);
+        samples(PITCH_WINDOW_SAMPLE_COUNT - 2, 0, 0); expect(0, 0);
+        tick(0, 0); expect(400, 400); assert(kobukiDebug.phase == CLIMB_RAMP);
+    }
+    else if (strcmp(name, "ramp_entry_cliff_priority") == 0) {
+        start(0); terrain(15, 0); input.bumps_wheelDrops.bumpLeft = true;
+        samples(3, 0, 0); expect(0, 0);
+        input.cliffLeft = true; tick(0, 0); expect(-100, -160);
+        assert(kobukiDebug.phase == APPROACH_RAMP && kobukiDebug.motion == CLIFF_BACKUP);
+    }
+    else if (strcmp(name, "ramp_entry_no_premature_top") == 0) {
+        start(0); terrain(15, 0); samples(FINISH_VOTE_SAMPLE_COUNT - 1, 0, 0);
+        assert(kobukiDebug.phase == APPROACH_RAMP);
+        terrain(0, 0); samples(FINISH_VOTE_SAMPLE_COUNT, 0, 0);
+        assert(kobukiDebug.phase == APPROACH_RAMP && kobukiDebug.finishStage == FINISH_WAIT_UPHILL);
+        terrain(15, 0); samples(PITCH_WINDOW_SAMPLE_COUNT, 0, 0);
+        assert(kobukiDebug.phase == CLIMB_RAMP && kobukiDebug.finishStage == FINISH_WAIT_TOP);
+    }
+    else { return 0; }
+    return 1;
+}
+
 static int crestStopScenario(const char * const name)
 {
     int i, j;
@@ -236,7 +292,10 @@ static int redesignedStopScenario(const char * const name)
         assert(kobukiDebug.finishStage == FINISH_WAIT_UPHILL);
         acceleration.x = acceleration.y = acceleration.z = 0;
         tick(0, 0);
-        assert(kobukiDebug.finishStage == FINISH_WAIT_TOP);
+        /* 较短的停车窗口不能先于主状态确认上坡。 */
+        assert(kobukiDebug.finishStage == FINISH_WAIT_UPHILL);
+        terrain(15, 0); samples(PITCH_WINDOW_SAMPLE_COUNT, 0, 0);
+        assert(kobukiDebug.phase == CLIMB_RAMP && kobukiDebug.finishStage == FINISH_WAIT_TOP);
         terrain(0, 0); samples(FINISH_VOTE_SAMPLE_COUNT, 0, 0);
         terrain(-4, 0); samples(FINISH_VOTE_SAMPLE_COUNT - 1, 0, 0);
         acceleration.x = acceleration.y = acceleration.z = 0;
@@ -399,7 +458,7 @@ int main(int argc, char **argv)
     int i;
     assert(argc >= 2);
     if (argc >= 3) { simulator = strcmp(argv[2], "simulator") == 0; }
-    if (crestStopScenario(argv[1]) || redesignedStopScenario(argv[1]) || repairScenario(argv[1])) {
+    if (rampEntryScenario(argv[1]) || crestStopScenario(argv[1]) || redesignedStopScenario(argv[1]) || repairScenario(argv[1])) {
         printf("PASS %s (%s)\n", argv[1], simulator ? "simulator" : "hardware interface");
         return 0;
     }
