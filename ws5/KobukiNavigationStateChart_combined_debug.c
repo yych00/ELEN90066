@@ -3,9 +3,9 @@
  * 基线：提交 3212560 的 KobukiNavigationStateChart_combined_debug.c。
  * 停车只接受：进入下坡置 downhillFlag -> 下坡后确认平地直接停车锁止。
  * 初始平面、上坡后的坡顶平面均不置停车标志；B1 重置两个标志。
- * 保留坡度阈值、8 中 7 投票、Y 纠偏与轮速；combined.c 保持原文件。
+ * 坡度采用 8 中 6 投票，保留 Y 纠偏与轮速；combined.c 保持原文件。
  * 正常直行、绕障直行都检测上坡；确认上坡后立即取消地面避障。
- * 碰撞同时读到上坡时先停车，重新收满 8 次读数：7 票上坡才进入爬坡。
+ * 碰撞同时读到上坡时先停车，重新收满 8 次读数：6 票上坡才进入爬坡。
  * 确认失败且碰撞仍在才倒车；无效读数也占窗口，避免无限等待。
  * 接近坡道的碰撞避障采用 new5_downhill_stop_jzcv2.c 的动作与航向控制。
  * 保留原两倍轮速、坡道与终点流程；加速度单位 g，距离 mm，轮速 mm/s。
@@ -24,7 +24,7 @@
 #define PITCH_THRESHOLD_DEG              5.0
 #define LEVEL_TILT_DEG                   4.5  /* 整体倾角：同时约束前后和横向 */
 #define PITCH_WINDOW_SAMPLE_COUNT        8
-#define PITCH_REQUIRED_SAMPLE_COUNT      7
+#define PITCH_REQUIRED_SAMPLE_COUNT      6
 #define Y_ALIGNMENT_THRESHOLD_G          0.01
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
@@ -216,8 +216,10 @@ static void resetCliffVotes(navigation_t * const nav)
     }
 }
 
-/* 【坡度判断】横着处于斜坡不能算平地；过小/过大的合加速度不投有效票。 */
-static slopeSample_t classifySlope(const accelerometer_t accel)
+/* 【坡度判断】通常按整体倾角判平地；已确认下坡后仅按前后俯仰判落地。
+ * 过小/过大的合加速度不投有效票。落地判断不受 Y 轴倾角直接限制。
+ */
+static slopeSample_t classifySlope(const accelerometer_t accel, const bool landingCheck)
 {
     double lateral = sqrt(accel.y * accel.y + accel.z * accel.z);
     double magnitude = sqrt(accel.x * accel.x + lateral * lateral);
@@ -229,7 +231,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
         fabs(accel.z)) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
-    if (tilt <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
+    if ((landingCheck ? fabs(pitch) : tilt) <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
     return SAMPLE_UNKNOWN;
 }
 
@@ -240,7 +242,8 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
     int i;
     int up = 0, down = 0, level = 0;
     routePhase_t next = nav->phase;
-    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel);
+    nav->pitchSamples[nav->pitchIndex] = classifySlope(accel,
+        nav->phase == DESCEND_RAMP && nav->downhillFlag);
     nav->pitchIndex = (nav->pitchIndex + 1) % PITCH_WINDOW_SAMPLE_COUNT;
     if (nav->pitchCount < PITCH_WINDOW_SAMPLE_COUNT) { nav->pitchCount++; }
     if (nav->pitchCount != PITCH_WINDOW_SAMPLE_COUNT) { return; }
@@ -515,7 +518,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     }
 
     /* 【入口确认】轮速保持零，使用碰撞之后新收集的完整 8 次读数。
-     * updateRoute 达到 7 票时会切到 CLIMB_RAMP，并通过 resetVotes 退出确认。
+     * updateRoute 收满 8 次且达到 6 票时切到 CLIMB_RAMP，并通过 resetVotes 退出确认。
      * 收满后仍未确认，就恢复地面处理；不因持续碰撞反复重开确认窗口。
      */
     if (nav.confirmingUphill) {
@@ -547,7 +550,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
      */
     if (nav.phase == APPROACH_RAMP && bumper
         && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
-        && classifySlope(accelAxes) == SAMPLE_UPHILL) {
+        && classifySlope(accelAxes, false) == SAMPLE_UPHILL) {
         resetVotes(&nav);
         nav.confirmingUphill = true;
         nav.headingControlActive = false;
