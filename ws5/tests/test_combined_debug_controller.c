@@ -22,6 +22,148 @@ static void configuredTerrain(const double pitchDeg, const double sideG)
     acceleration.x = axes[0]; acceleration.y = axes[1]; acceleration.z = axes[2];
 }
 
+/* 默认接线下额外施加未知安装偏角，验证自动地面参考而非手工配置补偿。 */
+static void biasedTerrain(const double pitchDeg, const double pitchBias, const double rollBias)
+{
+    double x = sin(pitchDeg / RAD_TO_DEG), z = cos(pitchDeg / RAD_TO_DEG);
+    double p = pitchBias / RAD_TO_DEG, r = rollBias / RAD_TO_DEG;
+    double intermediateZ = -x * sin(p) + z * cos(p);
+    acceleration.x = x * cos(p) + z * sin(p);
+    acceleration.y = intermediateZ * sin(r);
+    acceleration.z = intermediateZ * cos(r);
+}
+
+static void startBiased(const double pitchBias, const double rollBias)
+{
+    memset(&input, 0, sizeof(input));
+    biasedTerrain(0, pitchBias, rollBias);
+    input.buttons.B1 = true; tick(0, 0); expect(0, 0);
+    input.buttons.B1 = false; samples(8, 0, 0); expect(0, 0);
+    assert(kobukiDebug.floorReferenceValid);
+    input.buttons.B0 = true; tick(0, 0); expect(0, 0);
+    input.buttons.B0 = false; tick(0, 0); expect(400, 400);
+}
+
+static int redesignedStopScenario(const char * const name)
+{
+    int i;
+    if (strcmp(name, "stop_floor_bias") == 0) {
+        startBiased(4, 3);
+        assert(fabs(kobukiDebug.pitchDeg) < 0.001 && kobukiDebug.tiltDeg < 0.001);
+        biasedTerrain(15, 4, 3); samples(8, 0, 0);
+        assert(kobukiDebug.phase == CLIMB_RAMP);
+        biasedTerrain(0, 4, 3); samples(24, 100, 0); expect(300, 300);
+        assert(!kobukiDebug.descentConfirmed && kobukiDebug.finishDistance == 0);
+        biasedTerrain(-15, 4, 3); samples(8, 200, 0);
+        assert(kobukiDebug.descentConfirmed);
+        biasedTerrain(0, 4, 3); samples(8, 300, 0); expect(400, 400);
+        tick(499, 0); expect(400, 400); tick(500, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_shallow_descent") == 0) {
+        start(0); climb(); terrain(0, 0); samples(8, 0, 0);
+        terrain(-4, 0); samples(16, 100, 0); expect(200, 200);
+        assert(kobukiDebug.descentConfirmed && kobukiDebug.finishStage == FINISH_WAIT_GROUND);
+        terrain(0, 0); samples(8, 300, 0); expect(400, 400);
+        tick(499, 0); expect(400, 400); tick(500, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_noisy_level") == 0) {
+        start(0); descend();
+        terrain(4, 0); samples(2, 0, 0);
+        terrain(0, 0); samples(5, 0, 0); expect(200, 200);
+        tick(0, 0); expect(400, 400);
+        assert(kobukiDebug.finishStage == FINISH_COUNT_DISTANCE);
+        tick(199, 0); expect(400, 400); tick(200, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_reject_five_level_votes") == 0) {
+        start(0); descend();
+        for (i = 0; i < 80; i++) {
+            terrain(i % 8 < 5 ? 0 : 4, 0); tick(i * 20, 0);
+        }
+        assert(kobukiDebug.finishStage == FINISH_WAIT_GROUND && kobukiDebug.finishDistance == 0);
+        expect(200, 200);
+    }
+    else if (strcmp(name, "stop_reject_top") == 0) {
+        start(0); terrain(0, 0); samples(32, 100, 0);
+        assert(kobukiDebug.finishStage == FINISH_WAIT_UPHILL);
+        climb(); terrain(0, 0); samples(32, 1000, 0); expect(300, 300);
+        for (i = 0; i < 80; i++) {
+            terrain(i % 8 < 2 ? -4 : 0, 0); tick(1000 + i * 20, 0);
+        }
+        assert(!kobukiDebug.descentConfirmed && kobukiDebug.finishDistance == 0);
+        expect(300, 300);
+    }
+    else if (strcmp(name, "stop_pause_keeps_descent") == 0) {
+        start(0); descend(); terrain(0, 0); samples(5, 0, 0);
+        pauseAt(0, 0); assert(kobukiDebug.descentConfirmed);
+        resumeAt(0, 0); samples(5, 0, 0); expect(200, 200);
+        assert(kobukiDebug.finishSampleCount == 6);
+        samples(2, 0, 0); expect(400, 400);
+        tick(200, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_reference_fixed_on_resume") == 0) {
+        start(0); climb(); pauseAt(0, 0); samples(32, 0, 0); resumeAt(0, 0);
+        assert(fabs(kobukiDebug.floorX) < 0.001 && fabs(kobukiDebug.pitchDeg - 15) < 0.001);
+        terrain(-15, 0); samples(8, 0, 0);
+        terrain(0, 0); samples(8, 0, 0); tick(200, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_start_reference_guard") == 0) {
+        memset(&input, 0, sizeof(input));
+        acceleration.x = acceleration.y = acceleration.z = 0;
+        input.buttons.B1 = true; tick(0, 0);
+        input.buttons.B1 = false; input.buttons.B0 = true; tick(0, 0);
+        input.buttons.B0 = false; samples(16, 0, 0); expect(0, 0);
+        assert(!kobukiDebug.floorReferenceValid);
+        for (i = 0; i < 16; i++) { terrain(i % 2 ? 4 : -4, 0); tick(0, 0); expect(0, 0); }
+        assert(!kobukiDebug.floorReferenceValid);
+        terrain(0, 0); samples(8, 0, 0); expect(400, 400);
+        assert(kobukiDebug.floorReferenceValid);
+        input.buttons.B1 = true; tick(0, 0); expect(0, 0);
+        assert(!kobukiDebug.floorReferenceValid && !kobukiDebug.descentConfirmed);
+        input.buttons.B1 = false; samples(16, 0, 0); expect(0, 0);
+        /* 启动前搬动后的新姿态要重采，不能使用上电时的旧参考。 */
+        biasedTerrain(0, 4, 0); samples(7, 0, 0); expect(0, 0);
+        assert(!kobukiDebug.floorReferenceValid);
+        tick(0, 0); assert(kobukiDebug.floorReferenceValid);
+        /* 参考已采好，但当前输入无效时也不能启动。 */
+        acceleration.x = acceleration.y = acceleration.z = 0;
+        input.buttons.B0 = true; tick(0, 0);
+        input.buttons.B0 = false; samples(8, 0, 0); expect(0, 0);
+        terrain(0, 0); samples(7, 0, 0); expect(0, 0);
+        tick(0, 0); expect(400, 400);
+    }
+    else if (strcmp(name, "stop_invalid_level") == 0) {
+        start(0); descend(); terrain(0, 0); samples(6, 0, 0);
+        acceleration.x = acceleration.y = acceleration.z = 0;
+        samples(16, 1000, 0); expect(200, 200);
+        assert(kobukiDebug.finishStage == FINISH_WAIT_GROUND);
+        terrain(0, 0); samples(8, 1000, 0);
+        tick(1199, 0); expect(400, 400); tick(1200, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_vote_outlier_last") == 0) {
+        start(0); pauseAt(0, 0);
+        terrain(15, 0); resumeAt(0, 0); samples(6, 0, 0);
+        assert(kobukiDebug.finishStage == FINISH_WAIT_UPHILL);
+        acceleration.x = acceleration.y = acceleration.z = 0;
+        tick(0, 0);
+        assert(kobukiDebug.finishStage == FINISH_WAIT_DOWNHILL);
+        terrain(-4, 0); samples(7, 0, 0);
+        acceleration.x = acceleration.y = acceleration.z = 0;
+        tick(0, 0);
+        assert(kobukiDebug.descentConfirmed);
+        terrain(0, 0); samples(8, 0, 0);
+        tick(200, 0); expect(0, 0);
+    }
+    else if (strcmp(name, "stop_latest_level_required") == 0) {
+        start(0); descend(); terrain(0, 0); samples(6, 0, 0);
+        terrain(4, 0); samples(2, 0, 0); expect(200, 200);
+        assert(kobukiDebug.finishVotes == 6 && kobukiDebug.finishSampleCount == 8);
+        terrain(0, 0); tick(0, 0); expect(400, 400);
+        tick(200, 0); expect(0, 0);
+    }
+    else { return 0; }
+    return 1;
+}
+
 static int repairScenario(const char * const name)
 {
     int i;
@@ -149,8 +291,13 @@ static int repairScenario(const char * const name)
         assert(kobukiDebug.pitchCount == 0 && kobukiDebug.yCorrection == 0);
     }
     else if (strcmp(name, "bad_accel_configuration") == 0) {
-        start(0); terrain(15, 0.02); samples(20, 0, 0);
+        memset(&input, 0, sizeof(input)); terrain(0, 0);
+        input.buttons.B1 = true; tick(0, 0);
+        input.buttons.B1 = false; input.buttons.B0 = true; tick(0, 0);
+        input.buttons.B0 = false;
+        terrain(15, 0.02); samples(20, 0, 0); expect(0, 0);
         assert(!kobukiDebug.accelValid && kobukiDebug.phase == APPROACH_RAMP);
+        assert(!kobukiDebug.floorReferenceValid);
     }
     else { return 0; }
     return 1;
@@ -161,7 +308,7 @@ int main(int argc, char **argv)
     int i;
     assert(argc >= 2);
     if (argc >= 3) { simulator = strcmp(argv[2], "simulator") == 0; }
-    if (repairScenario(argv[1])) {
+    if (redesignedStopScenario(argv[1]) || repairScenario(argv[1])) {
         printf("PASS %s (%s)\n", argv[1], simulator ? "simulator" : "hardware interface");
         return 0;
     }

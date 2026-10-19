@@ -32,9 +32,22 @@ static void expect(const int16_t left, const int16_t right)
 static void terrain(const double pitch, const double y)
 {
     double x = sin(pitch / RAD_TO_DEG);
+#ifdef FLOOR_REFERENCE_SAMPLE_COUNT
+    /* 1.2 的启动校准需要真实单位/接线输入；测试模型反向生成传感器读数。 */
+    double z = sqrt(1 - x * x - y * y);
+    double pm = ACCEL_MOUNT_PITCH_DEG / RAD_TO_DEG;
+    double rm = ACCEL_MOUNT_ROLL_DEG / RAD_TO_DEG;
+    double rz = -x * sin(pm) + z * cos(pm);
+    double axes[3];
+    axes[ACCEL_FORWARD_AXIS] = (x * cos(pm) + z * sin(pm)) * ACCEL_FORWARD_SIGN * ACCEL_UNITS_PER_G;
+    axes[ACCEL_SIDE_AXIS] = (y * cos(rm) + rz * sin(rm)) * ACCEL_SIDE_SIGN * ACCEL_UNITS_PER_G;
+    axes[ACCEL_VERTICAL_AXIS] = (-y * sin(rm) + rz * cos(rm)) * ACCEL_VERTICAL_SIGN * ACCEL_UNITS_PER_G;
+    acceleration.x = axes[0]; acceleration.y = axes[1]; acceleration.z = axes[2];
+#else
     acceleration.x = x;
     acceleration.y = y;
     acceleration.z = sqrt(1 - x * x - y * y);
+#endif
 }
 
 static void samples(const int count, const int32_t distance, const int32_t angle)
@@ -51,6 +64,11 @@ static void start(const int32_t angle)
     tick(0, angle);
     expect(0, 0);
     input.buttons.B1 = false;
+#ifdef FLOOR_REFERENCE_SAMPLE_COUNT
+    /* 上电后的初始平面静止采样，不属于落地减速确认。 */
+    samples(FLOOR_REFERENCE_SAMPLE_COUNT, 0, angle);
+    expect(0, 0);
+#endif
     input.buttons.B0 = true;
     tick(0, angle);
     expect(0, 0);
@@ -237,8 +255,14 @@ int main(int argc, char **argv)
         climb();
         terrain(0, 0); samples(8, 0, 0); expect(300, 300);
         terrain(-15, 0); samples(8, 0, 0); expect(200, 200);
-        terrain(0, 0); samples(7, 0, 0); expect(200, 200);
+        terrain(0, 0);
+#ifdef FINISH_LEVEL_REQUIRED
+        samples(5, 0, 0); expect(200, 200);
+        samples(3, 0, 0); expect(400, 400);
+#else
+        samples(7, 0, 0); expect(200, 200);
         tick(0, 0); expect(400, 400);
+#endif
         tick(199, 0); expect(400, 400);
         tick(200, 0); expect(0, 0);
     }
@@ -447,6 +471,9 @@ int main(int argc, char **argv)
         input.buttons.B0 = false;
         tick(0, 0); expect(0, 0);
         tick(0, 0); expect(0, 0);
+#ifdef FLOOR_REFERENCE_SAMPLE_COUNT
+        samples(FLOOR_REFERENCE_SAMPLE_COUNT, 0, 0);
+#endif
         resumeAt(0, 0); expect(400, 400);
     }
     else if (strcmp(argv[1], "speed_cap") == 0) {

@@ -21,6 +21,9 @@ $scenarios = @(
     'repeated_collision_heading',
     'configured_course', 'y_limited_pair', 'y_sensitive_switching', 'invalid_y_input', 'finish_distance_wrap',
     'finish_distance_frozen', 'ramp_clear_vote_threshold', 'no_slope_during_turn',
+    'stop_floor_bias', 'stop_shallow_descent', 'stop_noisy_level', 'stop_reject_five_level_votes',
+    'stop_reject_top', 'stop_pause_keeps_descent', 'stop_reference_fixed_on_resume',
+    'stop_start_reference_guard', 'stop_invalid_level', 'stop_latest_level_required', 'stop_vote_outlier_last',
     'course_20ms', 'course_64ms', 'course_100ms', 'course_250ms',
     'course_jitter', 'course_capped200', 'course_wheel_drift'
 )

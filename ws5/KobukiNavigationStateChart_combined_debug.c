@@ -1,5 +1,8 @@
 /*
- * WS5 + 地面避障完整控制器：版本 1.1，combined.c 保留 1.0 对照。
+ * WS5 + 地面避障完整控制器：版本 1.2，combined.c 保留 1.0 对照。
+ * 独立停车：启动前静止采集地面基准 -> 上坡证据 -> 下坡锁存 -> 回到地面 -> 直行 200 mm。
+ * 主坡度仍为 8 中 7；独立下坡门槛 -3.5 度、8 中 7，落地为相对倾角 3 度内、8 中 6。
+ * B1 清除地面基准和停车记录；暂停/避让清空停车投票，但不丢弃已确认的下坡。
  * 修复：绕行可确认上坡；限速保留 Y 差速；回正越过目标后反向；终点计距支持回绕。
  * 加速度提供单位、轴映射及安装偏角配置，未知实机输入时保留默认 g 单位。
  * Eclipse 可查看 kobukiDebug：阶段、传感器、投票、计距、轮速；不依赖 LED/myRIO 头文件。
@@ -25,10 +28,23 @@
 #define Y_FILTER_SAMPLE_COUNT            5
 #define Y_REQUIRED_SAMPLE_COUNT          3
 
+/* 【独立停车参数】启动在初始平面，静止输出零轮速时自动建立基准，不增加低速落地阶段。
+ * 地面参考使用 8 个稳定重力方向；只在首次启动前采集，行驶/恢复时绝不重新校准。
+ * 路线识别保留 8 中 7；停车单独容忍落地窗口里的两次振动，不依赖主状态先到 DESCEND。
+ */
+#define FLOOR_REFERENCE_SAMPLE_COUNT     8
+#define FLOOR_REFERENCE_STABILITY_DEG    2.0
+#define FINISH_VOTE_SAMPLE_COUNT         8
+#define FINISH_UP_REQUIRED               7
+#define FINISH_DOWN_REQUIRED             7
+#define FINISH_LEVEL_REQUIRED            6
+#define FINISH_DOWN_PITCH_DEG            -3.5
+#define FINISH_LEVEL_TILT_DEG            3.0
+
 /* 【实机输入配置】轴编号 0=X、1=Y、2=Z；配置映射后的 X 朝前、Y 横向、Z 朝上。
  * 默认输入单位 g；若调用方传 m/s^2，把 ACCEL_UNITS_PER_G 设为 9.80665。
- * 不自动猜单位/方向，不在坡上自动校准。平放静止时测安装偏角后再设置补偿。
- * 先消除横滚，再消除俯仰；默认偏角 0。所有配置均可在工程 -D 宏中覆盖。
+ * 不自动猜单位/方向。安装偏角配置可选；首次启动另行采集地面参考，行驶中不重校。
+ * 先消除配置的横滚，再消除俯仰；默认偏角 0。所有配置均可在工程 -D 宏中覆盖。
  */
 #ifndef ACCEL_UNITS_PER_G
 #define ACCEL_UNITS_PER_G                1.0
@@ -144,6 +160,11 @@ typedef enum {
 
 typedef enum { SAMPLE_UNKNOWN = 0, SAMPLE_UPHILL, SAMPLE_DOWNHILL, SAMPLE_LEVEL } slopeSample_t;
 
+typedef enum {
+    FINISH_WAIT_UPHILL = 0, FINISH_WAIT_DOWNHILL, FINISH_WAIT_GROUND,
+    FINISH_COUNT_DISTANCE, FINISH_LOCKED
+} finishStage_t;
+
 typedef struct {
     bool initialized;
     bool hasStarted;
@@ -172,11 +193,20 @@ typedef struct {
     int ySamples[Y_FILTER_SAMPLE_COUNT];
     int yIndex;
     int yCount;
+    bool floorReferenceValid;
+    int floorSampleCount;
+    double floorSum[3], floorNormal[3], floorForward[3], floorSide[3];
+    int32_t floorLastDistance, floorLastAngle;
+    finishStage_t finishStage;
+    unsigned char finishSamples[FINISH_VOTE_SAMPLE_COUNT];
+    int finishIndex, finishCount;
 } navigation_t;
 
 /* 【只读调试快照】在 Eclipse Expressions 中展开 kobukiDebug。
  * phase: 0接近、1上坡、2坡顶、3下坡、4终点直行、5停车。
  * motion: 0直行、1碰撞倒车、2转向、3绕行、4回正、5悬崖倒车、6悬崖转向。
+ * finishStage: 0等上坡、1等下坡、2下坡已锁存/等平地、3计距、4停车锁止。
+ * floorReferenceValid 为 false 时首次启动保持停车；pitchDeg/tiltDeg 是相对启动地面的角度。
  * invalidAccelSamples/stillDistanceSamples 是连续调用次数，不是毫秒或超时。
  */
 typedef struct {
@@ -191,6 +221,9 @@ typedef struct {
     int64_t forwardDelta;
     bool countingFinish, finished;
     int16_t maxWheelSpeed, leftWheelSpeed, rightWheelSpeed;
+    bool floorReferenceValid, descentConfirmed;
+    int floorSamples, finishStage, finishVotes, finishSampleCount;
+    double floorX, floorY, floorZ;
 } kobukiDebug_t;
 volatile kobukiDebug_t kobukiDebug;
 
@@ -233,6 +266,84 @@ static accelerometer_t prepareAcceleration(const accelerometer_t raw)
     kobukiDebug.tiltDeg = atan2(sqrt(result.x * result.x + result.y * result.y), fabs(result.z)) * RAD_TO_DEG;
     kobukiDebug.accelValid = true;
     return result;
+}
+
+/* 【启动平地参考】有效、方向稳定且里程/航向不变时采集；未完成则保持停车。
+ * 此处仅平均启动前的重力参考，行驶中的坡度/Y 判断仍使用逐次原始读数投票。
+ */
+static void collectFloorReference(navigation_t * const nav, const accelerometer_t accel,
+    const int32_t distance, const int32_t angle, const bool alarm)
+{
+    double unit[3], sumLength, cosine, forwardLength;
+    int i;
+    bool moved = distance != nav->floorLastDistance || angle != nav->floorLastAngle;
+    if (nav->hasStarted) { return; }
+    if (!kobukiDebug.accelValid || alarm || distance != nav->floorLastDistance
+        || angle != nav->floorLastAngle) { nav->floorSampleCount = 0; }
+    nav->floorLastDistance = distance; nav->floorLastAngle = angle;
+    if (!kobukiDebug.accelValid || alarm) { nav->floorReferenceValid = false; return; }
+    unit[0] = accel.x / kobukiDebug.magnitudeG;
+    unit[1] = accel.y / kobukiDebug.magnitudeG;
+    unit[2] = accel.z / kobukiDebug.magnitudeG;
+    /* 未启动前被搬动/改变朝向，必须重采；已经启动后则永久冻结本轮参考。 */
+    if (nav->floorReferenceValid) {
+        cosine = unit[0] * nav->floorNormal[0] + unit[1] * nav->floorNormal[1] + unit[2] * nav->floorNormal[2];
+        if (!moved && cosine >= cos(FLOOR_REFERENCE_STABILITY_DEG / RAD_TO_DEG)) { return; }
+        nav->floorReferenceValid = false;
+        nav->floorSampleCount = 0;
+    }
+    if (nav->floorSampleCount > 0) {
+        sumLength = sqrt(nav->floorSum[0] * nav->floorSum[0]
+            + nav->floorSum[1] * nav->floorSum[1] + nav->floorSum[2] * nav->floorSum[2]);
+        cosine = (unit[0] * nav->floorSum[0] + unit[1] * nav->floorSum[1]
+            + unit[2] * nav->floorSum[2]) / sumLength;
+        if (cosine < cos(FLOOR_REFERENCE_STABILITY_DEG / RAD_TO_DEG)) {
+            nav->floorSampleCount = 0;
+        }
+    }
+    if (nav->floorSampleCount == 0) { memset(nav->floorSum, 0, sizeof(nav->floorSum)); }
+    for (i = 0; i < 3; i++) { nav->floorSum[i] += unit[i]; }
+    nav->floorSampleCount++;
+    if (nav->floorSampleCount < FLOOR_REFERENCE_SAMPLE_COUNT) { return; }
+    sumLength = sqrt(nav->floorSum[0] * nav->floorSum[0]
+        + nav->floorSum[1] * nav->floorSum[1] + nav->floorSum[2] * nav->floorSum[2]);
+    for (i = 0; i < 3; i++) { nav->floorNormal[i] = nav->floorSum[i] / sumLength; }
+    /* 将传感器前向轴投影到初始地面，构造去除固定安装偏角的坐标基。 */
+    for (i = 0; i < 3; i++) {
+        nav->floorForward[i] = (i == 0 ? 1.0 : 0.0) - nav->floorNormal[0] * nav->floorNormal[i];
+    }
+    forwardLength = sqrt(nav->floorForward[0] * nav->floorForward[0]
+        + nav->floorForward[1] * nav->floorForward[1] + nav->floorForward[2] * nav->floorForward[2]);
+    if (forwardLength < 0.5) { nav->floorSampleCount = 0; return; }
+    for (i = 0; i < 3; i++) { nav->floorForward[i] /= forwardLength; }
+    nav->floorSide[0] = nav->floorNormal[1] * nav->floorForward[2] - nav->floorNormal[2] * nav->floorForward[1];
+    nav->floorSide[1] = nav->floorNormal[2] * nav->floorForward[0] - nav->floorNormal[0] * nav->floorForward[2];
+    nav->floorSide[2] = nav->floorNormal[0] * nav->floorForward[1] - nav->floorNormal[1] * nav->floorForward[0];
+    if (nav->floorSide[1] < 0.0) {
+        for (i = 0; i < 3; i++) { nav->floorSide[i] = -nav->floorSide[i]; }
+    }
+    nav->floorReferenceValid = true;
+}
+
+/* 基准一经建立，本轮始终沿用；因此回到同一地面时相对倾角接近零。 */
+static accelerometer_t relativeToFloor(const navigation_t * const nav, const accelerometer_t accel)
+{
+    accelerometer_t result = accel;
+    if (nav->floorReferenceValid && kobukiDebug.accelValid) {
+        result.x = accel.x * nav->floorForward[0] + accel.y * nav->floorForward[1] + accel.z * nav->floorForward[2];
+        result.y = accel.x * nav->floorSide[0] + accel.y * nav->floorSide[1] + accel.z * nav->floorSide[2];
+        result.z = accel.x * nav->floorNormal[0] + accel.y * nav->floorNormal[1] + accel.z * nav->floorNormal[2];
+        kobukiDebug.xG = result.x; kobukiDebug.yG = result.y; kobukiDebug.zG = result.z;
+        kobukiDebug.pitchDeg = atan2(result.x, sqrt(result.y * result.y + result.z * result.z)) * RAD_TO_DEG;
+        kobukiDebug.tiltDeg = atan2(sqrt(result.x * result.x + result.y * result.y), result.z) * RAD_TO_DEG;
+    }
+    return result;
+}
+
+/* 主路线切换不清空独立停车历史；暂停和避让只清票，不撤销已确认的上下坡证据。 */
+static void resetFinishVotes(navigation_t * const nav)
+{
+    nav->finishIndex = nav->finishCount = 0;
 }
 
 /* 成对缩放保留差速比例，例如上坡 400/300 在上限 200 时输出 200/150。 */
@@ -323,8 +434,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
     double tilt;
     if (!(magnitude >= 0.5 && magnitude <= 1.5)) { return SAMPLE_UNKNOWN; }
     pitch = atan2(accel.x, lateral) * RAD_TO_DEG;
-    tilt = atan2(sqrt(accel.x * accel.x + accel.y * accel.y),
-        fabs(accel.z)) * RAD_TO_DEG;
+    tilt = atan2(sqrt(accel.x * accel.x + accel.y * accel.y), accel.z) * RAD_TO_DEG;
     if (pitch >= PITCH_THRESHOLD_DEG) { return SAMPLE_UPHILL; }
     if (pitch <= -PITCH_THRESHOLD_DEG) { return SAMPLE_DOWNHILL; }
     if (tilt <= LEVEL_TILT_DEG) { return SAMPLE_LEVEL; }
@@ -332,8 +442,7 @@ static slopeSample_t classifySlope(const accelerometer_t accel)
 }
 
 /* 【路线阶段】只在正常前进或地面绕行前进时判断，倒车/转向不推进阶段。 */
-static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
-    const int32_t angle)
+static void updateRoute(navigation_t * const nav, const accelerometer_t accel)
 {
     int i;
     int up = 0, down = 0, level = 0;
@@ -359,7 +468,7 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         if (down >= PITCH_REQUIRED_SAMPLE_COUNT) { next = DESCEND_RAMP; }
         break;
     case DESCEND_RAMP:
-        if (level >= PITCH_REQUIRED_SAMPLE_COUNT) { next = FINISH_STRAIGHT; }
+        /* 落地由独立停车流程负责，不再把它绑定到本状态的 8 中 7 平地票。 */
         break;
     default:
         break;
@@ -369,12 +478,61 @@ static void updateRoute(navigation_t * const nav, const accelerometer_t accel,
         resetVotes(nav);
         /* 上坡期间关闭原地面避障动作；悬崖动作在本函数调用前已排除。 */
         if (!onGround(next)) { nav->motion = ROUTE_DRIVE; }
-        if (next == FINISH_STRAIGHT) {
-            nav->finishDistance = 0;
-            nav->countFinishDistance = false;
-            nav->routeHeading = angle;
-        }
     }
+}
+
+/* 【独立停车流程】先有上坡证据，再锁存下坡，最后确认回到启动地面。
+ * 逐次原始读数投票：上下坡 8 中 7，容许异常出现在窗口任意位置。
+ * 落地 8 中 6，且最新一次必须是平地，避免在刚发生的振动中开始终点计距。
+ * -3.5 度用于捕获主路线 -5 度门槛漏掉的浅下坡；落地门槛 3 度，与下坡不重叠。
+ * 悬崖/倒车/转向/暂停不采停车票；下坡锁存保留，恢复后收集新窗口。
+ */
+static void updateFinish(navigation_t * const nav, const int32_t angle, const bool cliff)
+{
+    unsigned char evidence = 0;
+    int i, votes = 0, required;
+    if (nav->finishStage >= FINISH_COUNT_DISTANCE) { return; }
+    if (cliff || (nav->motion != ROUTE_DRIVE && nav->motion != OBSTACLE_CLEAR)) {
+        resetFinishVotes(nav);
+        return;
+    }
+    if (nav->floorReferenceValid && kobukiDebug.accelValid) {
+        if (nav->finishStage == FINISH_WAIT_UPHILL) {
+            evidence = kobukiDebug.pitchDeg >= PITCH_THRESHOLD_DEG;
+        }
+        else if (nav->finishStage == FINISH_WAIT_DOWNHILL) {
+            evidence = kobukiDebug.pitchDeg <= FINISH_DOWN_PITCH_DEG;
+        }
+        else { evidence = kobukiDebug.tiltDeg <= FINISH_LEVEL_TILT_DEG; }
+    }
+    nav->finishSamples[nav->finishIndex] = evidence;
+    nav->finishIndex = (nav->finishIndex + 1) % FINISH_VOTE_SAMPLE_COUNT;
+    if (nav->finishCount < FINISH_VOTE_SAMPLE_COUNT) { nav->finishCount++; }
+    if (nav->finishCount < FINISH_VOTE_SAMPLE_COUNT
+        || (nav->finishStage == FINISH_WAIT_GROUND && !evidence)) { return; }
+    for (i = 0; i < nav->finishCount; i++) { votes += nav->finishSamples[i]; }
+    required = nav->finishStage == FINISH_WAIT_UPHILL ? FINISH_UP_REQUIRED
+        : (nav->finishStage == FINISH_WAIT_DOWNHILL ? FINISH_DOWN_REQUIRED : FINISH_LEVEL_REQUIRED);
+    if (votes < required) { return; }
+    if (nav->finishStage == FINISH_WAIT_UPHILL) {
+        nav->finishStage = FINISH_WAIT_DOWNHILL;
+    }
+    else if (nav->finishStage == FINISH_WAIT_DOWNHILL) {
+        nav->finishStage = FINISH_WAIT_GROUND;
+        nav->phase = DESCEND_RAMP;
+        nav->motion = ROUTE_DRIVE;
+        resetVotes(nav);
+    }
+    else {
+        nav->finishStage = FINISH_COUNT_DISTANCE;
+        nav->phase = FINISH_STRAIGHT;
+        nav->motion = ROUTE_DRIVE;
+        nav->finishDistance = 0;
+        nav->countFinishDistance = false;
+        nav->routeHeading = angle;
+        resetVotes(nav);
+    }
+    resetFinishVotes(nav);
 }
 
 /* 【Y 差速纠偏】五次中三次同方向超过 ±0.006 g 时进入；
@@ -531,6 +689,16 @@ static void outputSpeeds(navigation_t * const nav, const int16_t left,
     kobukiDebug.finished = nav->phase == FINISHED;
     kobukiDebug.maxWheelSpeed = maximum;
     kobukiDebug.leftWheelSpeed = *pLeft; kobukiDebug.rightWheelSpeed = *pRight;
+    kobukiDebug.floorReferenceValid = nav->floorReferenceValid;
+    kobukiDebug.floorSamples = nav->floorSampleCount;
+    kobukiDebug.floorX = nav->floorNormal[0];
+    kobukiDebug.floorY = nav->floorNormal[1];
+    kobukiDebug.floorZ = nav->floorNormal[2];
+    kobukiDebug.finishStage = nav->finishStage;
+    kobukiDebug.descentConfirmed = nav->finishStage >= FINISH_WAIT_GROUND;
+    kobukiDebug.finishSampleCount = nav->finishCount;
+    kobukiDebug.finishVotes = 0;
+    for (i = 0; i < nav->finishCount; i++) { kobukiDebug.finishVotes += nav->finishSamples[i]; }
 }
 
 void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
@@ -553,7 +721,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     (void)isSimulator;
 
     calibratedAccel = prepareAcceleration(accelAxes);
-    kobukiDebug.slopeSample = classifySlope(calibratedAccel);
+    kobukiDebug.slopeSample = SAMPLE_UNKNOWN;
     kobukiDebug.yCorrection = 0;
     kobukiDebug.forwardDelta = 0;
     if (kobukiDebug.accelValid) { kobukiDebug.invalidAccelSamples = 0; }
@@ -570,6 +738,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
             pRightWheelSpeed, pLeftWheelSpeed);
         return;
     }
+
+    collectFloorReference(&nav, calibratedAccel, netDistance, netAngle, cliff || bumper);
+    calibratedAccel = relativeToFloor(&nav, calibratedAccel);
+    kobukiDebug.slopeSample = classifySlope(calibratedAccel);
 
     /* 用上一周期的命令决定计距：只加前进距离，不把倒车取绝对值。 */
     if (nav.countFinishDistance) {
@@ -589,6 +761,7 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     else { kobukiDebug.stillDistanceSamples = 0; }
     if (nav.phase == FINISH_STRAIGHT && nav.finishDistance >= FINISH_DISTANCE_MM) {
         nav.phase = FINISHED;
+        nav.finishStage = FINISH_LOCKED;
     }
     /* 【终点锁止】优先于 B0、bumper 和悬崖；任何输入都不能自动复跑。 */
     if (nav.phase == FINISHED) {
@@ -600,7 +773,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     /* 【B0 按钮】按下立即暂停；释放、再次按下并释放后才恢复。 */
     switch (nav.button) {
     case RUNNING:
-        if (sensors.buttons.B0) { nav.button = WAIT_PAUSE_RELEASE; resetVotes(&nav); }
+        if (sensors.buttons.B0) {
+            nav.button = WAIT_PAUSE_RELEASE;
+            resetVotes(&nav); resetFinishVotes(&nav);
+        }
         break;
     case WAIT_PAUSE_RELEASE:
         if (!sensors.buttons.B0) { nav.button = WAIT_START_PRESS; }
@@ -609,9 +785,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
         if (sensors.buttons.B0) { nav.button = WAIT_START_RELEASE; }
         break;
     case WAIT_START_RELEASE:
-        if (!sensors.buttons.B0) {
+        if (!sensors.buttons.B0 && nav.floorReferenceValid && kobukiDebug.accelValid) {
             nav.button = RUNNING;
             resetVotes(&nav);
+            resetFinishVotes(&nav);
             if (!nav.hasStarted) { nav.routeHeading = netAngle; nav.hasStarted = true; }
             if (nav.phase == APPROACH_RAMP && nav.motion == ROUTE_DRIVE) {
                 nav.routeHeading = netAngle;
@@ -634,8 +811,9 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
      */
     if (!cliff && (nav.motion == ROUTE_DRIVE || nav.motion == OBSTACLE_CLEAR)
         && nav.phase != FINISH_STRAIGHT) {
-        updateRoute(&nav, calibratedAccel, netAngle);
+        updateRoute(&nav, calibratedAccel);
     }
+    updateFinish(&nav, netAngle, cliff);
     if (nav.motion == CLIFF_BACKUP
         && backupDistanceReached(netDistance, nav.maneuverDistance, CLIFF_BACKUP_DISTANCE_MM)) {
         nav.maneuverAngle = netAngle;
