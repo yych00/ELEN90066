@@ -135,9 +135,9 @@ typedef struct {
     int ySamples[Y_FILTER_SAMPLE_COUNT];
     int yIndex;
     int yCount;
-    uint32_t yCorrectionDurationMs;
-    uint32_t yCooldownMs;
-    uint16_t lastTimeStamp;
+    int32_t yCorrectionDurationMs;
+    int32_t yCooldownMs;
+    int32_t lastTimeStamp; /* 用有符号 32 位保存完整的 16 位时间戳。 */
 } navigation_t;
 
 /* 【通用控制】已去掉调用方 maxWheelSpeed 速度上限限制。 */
@@ -430,7 +430,8 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     int32_t error;
     int32_t reorientSpeed;
     int64_t delta;
-    uint16_t dtMs = 64;
+    int32_t dtMs = 64;
+    int32_t timeStampDiff;
     bool cliff = sensors.cliffLeft || sensors.cliffCenter || sensors.cliffRight;
     bool bumper = sensors.bumps_wheelDrops.bumpLeft
         || sensors.bumps_wheelDrops.bumpCenter || sensors.bumps_wheelDrops.bumpRight;
@@ -438,8 +439,10 @@ void KobukiNavigationStatechart(const int16_t maxWheelSpeed,
     (void)isSimulator;
 
     if (sensors.TimeStamp != 0 && nav.lastTimeStamp != 0) {
-        uint16_t diff = (uint16_t)(sensors.TimeStamp - nav.lastTimeStamp);
-        if (diff > 0 && diff < 500) { dtMs = diff; }
+        timeStampDiff = (int32_t)sensors.TimeStamp - nav.lastTimeStamp;
+        /* 传感器时间戳从 65535 回到 0 时，显式补回一圈，代替无符号回绕。 */
+        if (timeStampDiff < 0) { timeStampDiff += 65536L; }
+        if (timeStampDiff > 0 && timeStampDiff < 500) { dtMs = timeStampDiff; }
     }
     nav.lastTimeStamp = sensors.TimeStamp;
 
